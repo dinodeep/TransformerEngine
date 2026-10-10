@@ -6,6 +6,7 @@
 
 import os
 import sys
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -153,12 +154,34 @@ def mhc_ref(x, weights, norm_fn, branch_fn, norm_epsilon, pre_mapping_epsilon, i
     post = 2 * jax.nn.sigmoid(w.post_scale * h[..., k : 2 * k] + w.post_bias)
     res = mhc_sinkhorn_ref(w.res_scale * h[..., 2 * k :].reshape(b, s, k, k) + w.res_bias, iters)
 
-    layer_input = jnp.einsum("bsk,bskd->bsd", pre, x32, precision=HIGHEST).astype(x.dtype)
-    layer_out = branch_fn(norm_fn(layer_input)).astype(jnp.float32)
+    layer_input = jnp.einsum("bsk,bskd->bsd", pre, x32, precision=HIGHEST)
+    layer_input = _kernel_boundary(layer_input, x.dtype).astype(x.dtype)
+    layer_out = branch_fn(norm_fn(layer_input))
+    layer_out = _kernel_boundary(layer_out.astype(jnp.float32), layer_out.dtype)
     out = layer_out[:, :, None, :] * post[..., None] + jnp.einsum(
         "bskm,bskd->bsmd", res, x32, precision=HIGHEST
     )
-    return out.astype(x.dtype)
+    return _kernel_boundary(out, x.dtype).astype(x.dtype)
+
+
+def _reduce_precision(y, dtype):
+    info = jnp.finfo(dtype)
+    return jax.lax.reduce_precision(y, exponent_bits=info.nexp, mantissa_bits=info.nmant)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(1,))
+def _kernel_boundary(y, dtype):
+    """
+    Round fp32 y and its cotangent to `dtype`, as where the kernels read or write an array.
+    XLA may otherwise keep fused low-precision intermediates in fp32 (xla_allow_excess_precision).
+    """
+    return _reduce_precision(y, dtype)
+
+
+_kernel_boundary.defvjp(
+    lambda y, dtype: (_reduce_precision(y, dtype), None),
+    lambda dtype, _, g: (_reduce_precision(g, dtype),),
+)
 
 
 def _norm_fn(y):
