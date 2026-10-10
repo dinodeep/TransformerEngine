@@ -158,7 +158,8 @@ class _MHCPrimitive(BasePrimitive):
             _sharding(mesh, token_spec, info, layout, f"{cls.__name__}.arg{i}")
             for i, (info, layout) in enumerate(zip(arg_infos, in_layouts))
         )
-        out_shardings = tuple(
+        # Must match the container type of the results (tuple or list).
+        out_shardings = type(result_infos)(
             _sharding(mesh, token_spec, info, layout, f"{cls.__name__}.out{i}")
             for i, (info, layout) in enumerate(zip(result_infos, out_layouts))
         )
@@ -169,7 +170,7 @@ class _MHCPrimitive(BasePrimitive):
             if axes:
                 for i in cls.reduced_outputs:
                     outputs[i] = jax.lax.psum(outputs[i], axes)
-            return tuple(outputs)
+            return type(result_infos)(outputs)
 
         return mesh, sharded_impl, out_shardings, arg_shardings
 
