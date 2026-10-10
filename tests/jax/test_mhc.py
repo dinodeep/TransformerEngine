@@ -296,7 +296,8 @@ class TestMHCOps:
     @pytest_parametrize_wrapper("b,s,C", CONFIGS)
     @pytest_parametrize_wrapper("dtype", DTYPES)
     @pytest_parametrize_wrapper("recompute", [False, True])
-    def test_mhc_sinkhorn(self, b, s, C, dtype, recompute):
+    @pytest_parametrize_wrapper("iters", [1, 20])
+    def test_mhc_sinkhorn(self, b, s, C, dtype, recompute, iters):
         del C
         tols = get_tols(dtype)
         n = N_STREAMS
@@ -305,13 +306,14 @@ class TestMHCOps:
         # Rows and columns of the output each sum to 1, so a sum loss has a ~zero gradient.
         cotangent = _normal(keys[1], (s, b, n, n), jnp.float32)
 
-        fused = lambda h: mhc_sinkhorn(h, n, recompute_hist=recompute)
-        assert_allclose(jax.jit(fused)(h_res), jax.jit(mhc_sinkhorn_ref)(h_res), **tols)
+        fused = lambda h: mhc_sinkhorn(h, n, recompute_hist=recompute, iters=iters)
+        ref = lambda h: mhc_sinkhorn_ref(h, iters)
+        assert_allclose(jax.jit(fused)(h_res), jax.jit(ref)(h_res), **tols)
 
         def grad_of(fn):
             return jax.jit(jax.grad(lambda h: jnp.sum(fn(h).astype(jnp.float32) * cotangent)))
 
-        assert_allclose(grad_of(fused)(h_res), grad_of(mhc_sinkhorn_ref)(h_res), **tols)
+        assert_allclose(grad_of(fused)(h_res), grad_of(ref)(h_res), **tols)
 
     @pytest_parametrize_wrapper("b,s,C", CONFIGS)
     @pytest_parametrize_wrapper("dtype", DTYPES)
