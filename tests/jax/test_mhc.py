@@ -445,7 +445,9 @@ class TestMHC:
 
         # In bf16, the branch's backward and the sum of the bf16 grad_x partials amplify
         # rounding differences on a few elements, so element-wise checks are flaky. Instead,
-        # TE must be about as close as the bf16 reference to an fp32 ground truth.
+        # TE must be about as close as the bf16 reference to an fp32 ground truth. That error
+        # is too noisy on the few-element bias and scale gradients, which are checked
+        # element-wise instead.
         to_fp32 = lambda tree: jax.tree.map(lambda a: a.astype(jnp.float32), tree)
         true_dx, true_dweights = grad_of(self._ref_mhc)(to_fp32(x), to_fp32(weights))
 
@@ -457,6 +459,9 @@ class TestMHC:
             names, (dx, *dweights), (ref_dx, *ref_dweights), (true_dx, *true_dweights)
         ):
             assert grad.shape == truth.shape, name
+            if grad.size <= N_STREAMS * N_STREAMS:
+                assert_allclose(grad, ref_grad, err_msg=name, **get_tols(dtype))
+                continue
             te_err, ref_err = rel_err(grad, truth), rel_err(ref_grad, truth)
             assert te_err <= 2 * ref_err + 1e-3, f"{name}: TE error {te_err}, reference {ref_err}"
 
