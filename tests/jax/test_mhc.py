@@ -55,9 +55,9 @@ CONFIGS = {"L0": ALL_CONFIGS[:3], "L1": ALL_CONFIGS[:6], "L2": ALL_CONFIGS}
 DTYPES = [jnp.float32, jnp.bfloat16]
 # (x dtype, phi dtype)
 PROJECTION_DTYPES = [
-    (jnp.float32, jnp.float32),
-    (jnp.bfloat16, jnp.bfloat16),
-    (jnp.bfloat16, jnp.float32),
+    pytest.param((jnp.float32, jnp.float32), id="x_fp32_phi_fp32"),
+    pytest.param((jnp.bfloat16, jnp.bfloat16), id="x_bf16_phi_bf16"),
+    pytest.param((jnp.bfloat16, jnp.float32), id="x_bf16_phi_fp32"),
 ]
 
 
