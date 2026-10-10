@@ -955,6 +955,10 @@ def _mhc_sinkhorn_bwd_fused_recompute(
         )
         tl.store(g_hist_ptrs, g, mask=mask_batch[:, None])
 
+    # The history is read back below by threads other than those that stored it, so the stores
+    # must be visible to the whole block first.
+    tl.debug_barrier()
+
     # Backward pass
     grad_log_P = grad_out * P  # (BATCH_SIZE, n, n)
     zeros = tl.zeros_like(grad_log_P)
