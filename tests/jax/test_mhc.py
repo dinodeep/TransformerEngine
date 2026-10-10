@@ -141,9 +141,11 @@ def mhc_ref(x, weights, norm_fn, branch_fn, norm_epsilon, pre_mapping_epsilon, i
     """
     b, s, k, d = x.shape
     w = jax.tree.map(lambda p: p.astype(jnp.float32), weights)
-    x32 = x.astype(jnp.float32)
+    # Like the projection, aggregate and expand-combine kernels, each use of x upcasts it
+    # separately, so each contributes a grad_x rounded to x's dtype before they are summed.
+    upcast = lambda: x.astype(jnp.float32)
 
-    x_flat = x32.reshape(b, s, k * d)
+    x_flat = upcast().reshape(b, s, k * d)
     ms = jnp.mean(x_flat * x_flat, axis=-1, keepdims=True)
     alpha = jnp.concatenate([w.pre_alpha, w.post_alpha, w.res_alpha], axis=-1)
     h = jnp.einsum("bsm,mn->bsn", x_flat, w.norm_scale[:, None] * alpha, precision=HIGHEST)
@@ -153,10 +155,10 @@ def mhc_ref(x, weights, norm_fn, branch_fn, norm_epsilon, pre_mapping_epsilon, i
     post = 2 * jax.nn.sigmoid(w.post_scale * h[..., k : 2 * k] + w.post_bias)
     res = mhc_sinkhorn_ref(w.res_scale * h[..., 2 * k :].reshape(b, s, k, k) + w.res_bias, iters)
 
-    layer_input = jnp.einsum("bsk,bskd->bsd", pre, x32, precision=HIGHEST).astype(x.dtype)
+    layer_input = jnp.einsum("bsk,bskd->bsd", pre, upcast(), precision=HIGHEST).astype(x.dtype)
     layer_out = branch_fn(norm_fn(layer_input)).astype(jnp.float32)
     out = layer_out[:, :, None, :] * post[..., None] + jnp.einsum(
-        "bskm,bskd->bsmd", res, x32, precision=HIGHEST
+        "bskm,bskd->bsmd", res, upcast(), precision=HIGHEST
     )
     return out.astype(x.dtype)
 
