@@ -158,10 +158,10 @@ class _MHCPrimitive(BasePrimitive):
             _sharding(mesh, token_spec, info, layout, f"{cls.__name__}.arg{i}")
             for i, (info, layout) in enumerate(zip(arg_infos, in_layouts))
         )
-        out_shardings = [
+        out_shardings = tuple(
             _sharding(mesh, token_spec, info, layout, f"{cls.__name__}.out{i}")
             for i, (info, layout) in enumerate(zip(result_infos, out_layouts))
-        ]
+        )
         axes = _mesh_axes(token_spec)
 
         def sharded_impl(*arrays):
