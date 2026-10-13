@@ -7,20 +7,18 @@
 This module ties the forward and backward Triton kernels of
 ``transformer_engine.jax.triton_extensions.mhc`` together with ``jax.custom_vjp``.
 
-Per-stage APIs operate on the TE layout, where the hyper-connection input ``x`` has shape
-(..., C, n), i.e. the n streams are the innermost dimension:
+The hyper-connection input ``x`` has shape (..., C, n), i.e. the n streams are the innermost
+dimension, and the projection and RMSNorm weights are in the matching flattened (C, n) order:
 
     layer_input, H_post, H_res = mhc_generate_mix_and_aggregate(x, phi, alpha, beta)
     layer_output = layer(layer_input)  # Attention / FFN
     x = mhc_expand_combine(layer_output, None, H_post, x, H_res)
 
-``mhc`` (and its halves ``mhc_pre`` / ``mhc_post``) instead takes the parameters of MaxText's
-``ManifoldConstrainedHyperConnections`` layer and its (..., k, d) stream layout, and computes
-the same result.
+``mhc`` wraps these two calls around a sub-layer function.
 """
 
 from functools import partial
-from typing import Any, Callable, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -46,10 +44,6 @@ __all__ = [
     "mhc_aggregate",
     "mhc_expand_combine",
     "mhc_generate_mix_and_aggregate",
-    "MHCWeights",
-    "mhc_weights_to_params",
-    "mhc_pre",
-    "mhc_post",
     "mhc",
 ]
 
@@ -272,7 +266,9 @@ def mhc_expand_combine(
     """
     Expand the sub-layer output back to n streams and mix the residual streams:
 
-    out = (f [+ bias]) @ H_post + x @ H_res: (..., C, 1) @ (..., 1, n) + (..., C, n) @ (..., n, n)
+    out = (f [+ bias]) @ H_post + x @ H_res
+
+    (..., C, n, n) = (..., C, 1) @ (..., 1, n) + (..., C, n) @ (..., n, n)
 
     Parameters
     ----------
@@ -343,11 +339,14 @@ def mhc_generate_mix_and_aggregate(
     x : jnp.ndarray
         Hyper-connection input of shape (..., C, n).
     phi : jnp.ndarray
-        Projection matrix of shape (N, n*C), with columns in the flattened (C, n) order of x.
+        Projection matrix of shape (N, C*n) with N = 2n + n*n, with columns in the flattened
+        (C, n) order of x and rows for [H_pre (n), H_post (n), H_res (n*n)]. H_res is
+        row-major: row 2n + k*n + m gives H_res[k, m], the weight of input stream k in
+        output stream m.
     alpha : jnp.ndarray
         Scaling factors of shape (3,) for H_pre, H_post and H_res.
     beta : jnp.ndarray
-        Bias with N = 2n + n*n elements for [H_pre, H_post, H_res].
+        Bias with N elements, in the row order of phi.
     norm_weight : Optional[jnp.ndarray]
         RMSNorm weight of shape (n*C,), in the flattened (C, n) order of x.
     use_tf32, use_split_k :
@@ -380,112 +379,50 @@ def mhc_generate_mix_and_aggregate(
     return layer_input, h_post, h_res
 
 
-class MHCWeights(NamedTuple):
-    """
-    Parameters of MaxText's `ManifoldConstrainedHyperConnections` layer (mirrors MaxText's
-    `MhcWeights`), with k streams of dimension d.
-
-    norm_scale : (k*d,) RMSNorm scale.
-    pre_alpha, post_alpha : (k*d, k) projections for the pre and post mappings.
-    res_alpha : (k*d, k*k) projection for the residual mapping.
-    pre_bias, post_bias : (k,) biases of the pre and post mappings.
-    res_bias : (k, k) bias of the residual mapping.
-    pre_scale, post_scale, res_scale : (1,) scales of the pre, post and residual mappings.
-    """
-
-    norm_scale: jnp.ndarray
-    pre_alpha: jnp.ndarray
-    pre_bias: jnp.ndarray
-    pre_scale: jnp.ndarray
-    post_alpha: jnp.ndarray
-    post_bias: jnp.ndarray
-    post_scale: jnp.ndarray
-    res_alpha: jnp.ndarray
-    res_bias: jnp.ndarray
-    res_scale: jnp.ndarray
-
-
-def mhc_weights_to_params(
-    weights: MHCWeights,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """
-    Convert MaxText-layout weights into (phi, norm_weight, alpha, beta) of
-    `mhc_generate_mix_and_aggregate`.
-
-    MaxText flattens the streams as (k, d) while the TE kernels flatten them as (d, k), so the
-    projection and RMSNorm weights are permuted accordingly.
-    """
-    kd, k = weights.pre_alpha.shape
-    d = kd // k
-    assert weights.res_bias.shape == (
-        k,
-        k,
-    ), "Only the Sinkhorn residual mapping is supported; mHC-lite (enable_mhc_lite=True) is not"
-    projection = jnp.concatenate(
-        [weights.pre_alpha, weights.post_alpha, weights.res_alpha], axis=-1
-    )  # (k*d, N), rows in (k, d) order
-    N = projection.shape[-1]
-    phi = projection.reshape(k, d, N).transpose(2, 1, 0).reshape(N, d * k)
-    norm_weight = weights.norm_scale.reshape(k, d).T.reshape(d * k)
-    alpha = jnp.concatenate(
-        [
-            weights.pre_scale.reshape(-1),
-            weights.post_scale.reshape(-1),
-            weights.res_scale.reshape(-1),
-        ]
-    )
-    beta = jnp.concatenate(
-        [weights.pre_bias.reshape(-1), weights.post_bias.reshape(-1), weights.res_bias.reshape(-1)]
-    )
-    return phi, norm_weight, alpha, beta
-
-
-def mhc_pre(
+def mhc(
     x: jnp.ndarray,
-    weights: MHCWeights,
+    phi: jnp.ndarray,
+    alpha: jnp.ndarray,
+    beta: jnp.ndarray,
+    branch_fn: Callable[[jnp.ndarray], Any],
+    norm_weight: Optional[jnp.ndarray] = None,
     *,
-    norm_epsilon: float = 1e-5,
-    pre_mapping_epsilon: float = 1e-6,
-    sinkhorn_iterations: int = 20,
-    streams_last: bool = False,
+    has_aux: bool = False,
     use_tf32: bool = True,
     use_split_k: bool = False,
+    norm_eps: float = DEFAULT_NORM_EPS,
+    pre_eps: float = 0.0,
+    sinkhorn_iters: int = 20,
     recompute_sinkhorn_hist: bool = True,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Any:
     """
-    Compute the branch input of an mHC-wrapped branch, like the part of MaxText's
-    `ManifoldConstrainedHyperConnections.__call__` before `norm_fn`.
+    Manifold-constrained hyper connection around `branch_fn`:
+
+        layer_input, H_post, H_res = mhc_generate_mix_and_aggregate(x, phi, alpha, beta, ...)
+        out = mhc_expand_combine(branch_fn(layer_input), None, H_post, x, H_res)
+
+    i.e. layer_input[c] = sum_k H_pre[k] * x[c, k] and
+    out[c, m] = H_post[m] * branch_fn(layer_input)[c] + sum_k H_res[k, m] * x[c, k].
+    Only n = 4 streams are supported.
 
     Parameters
     ----------
     x : jnp.ndarray
-        Input streams of shape (..., k, d), or (..., d, k) if `streams_last`.
-    weights : MHCWeights
-        Layer parameters.
-    norm_epsilon : float
-        RMSNorm epsilon (MaxText's `normalization_layer_epsilon`).
-    pre_mapping_epsilon : float
-        Constant added to the pre mapping after its sigmoid.
-    sinkhorn_iterations : int
-        Number of Sinkhorn iterations (MaxText's `sinkhorn_iterations`).
-    streams_last : bool
-        Whether x already has the TE (..., d, k) layout. Otherwise x is transposed here and
-        the output transposed back in `mhc_post`.
-    use_tf32, use_split_k, recompute_sinkhorn_hist :
+        Hyper-connection input of shape (..., C, n).
+    phi, alpha, beta, norm_weight :
+        See `mhc_generate_mix_and_aggregate`.
+    branch_fn : Callable
+        The wrapped sub-layer (e.g. pre-norm + attention / FFN), called as
+        `branch_fn(layer_input)` with layer_input of shape (..., C).
+    has_aux : bool
+        Whether `branch_fn` returns `(layer_out, aux)`, in which case `(out, aux)` is returned.
+    use_tf32, use_split_k, norm_eps, pre_eps, sinkhorn_iters, recompute_sinkhorn_hist :
         See `mhc_generate_mix_and_aggregate`.
 
     Returns
     -------
-    layer_input : jnp.ndarray
-        Branch input of shape (..., d) in x's dtype.
-    h_post : jnp.ndarray
-        Post mapping of shape (..., k), to pass to `mhc_post`.
-    h_res : jnp.ndarray
-        Residual mapping of shape (..., k, k), to pass to `mhc_post`.
+    Output of shape (..., C, n) in x's dtype, or `(output, aux)` if `has_aux`.
     """
-    if not streams_last:
-        x = jnp.swapaxes(x, -1, -2)
-    phi, norm_weight, alpha, beta = mhc_weights_to_params(weights)
     layer_input, h_post, h_res = mhc_generate_mix_and_aggregate(
         x,
         phi,
@@ -494,120 +431,14 @@ def mhc_pre(
         norm_weight,
         use_tf32=use_tf32,
         use_split_k=use_split_k,
-        norm_eps=norm_epsilon,
-        pre_eps=pre_mapping_epsilon,
-        sinkhorn_iters=sinkhorn_iterations,
+        norm_eps=norm_eps,
+        pre_eps=pre_eps,
+        sinkhorn_iters=sinkhorn_iters,
         recompute_sinkhorn_hist=recompute_sinkhorn_hist,
     )
-    return layer_input, h_post, h_res
-
-
-def mhc_post(
-    layer_output: jnp.ndarray,
-    x: jnp.ndarray,
-    h_post: jnp.ndarray,
-    h_res: jnp.ndarray,
-    *,
-    bias: Optional[jnp.ndarray] = None,
-    streams_last: bool = False,
-    use_tf32: bool = True,
-) -> jnp.ndarray:
-    """
-    Apply the post mapping and residual stream mixing, like the part of MaxText's
-    `ManifoldConstrainedHyperConnections.__call__` after `branch_fn`.
-
-    Parameters
-    ----------
-    layer_output : jnp.ndarray
-        Branch output of shape (..., d).
-    x : jnp.ndarray
-        The input streams passed to `mhc_pre`, in the same layout.
-    h_post, h_res : jnp.ndarray
-        Mappings returned by `mhc_pre`.
-    bias : Optional[jnp.ndarray]
-        Optional bias of shape (d,) of the branch's last linear layer, fused here.
-    streams_last : bool
-        Whether x has, and the output uses, the TE (..., d, k) layout instead of (..., k, d).
-    use_tf32 : bool
-        Whether to use TF32 for the backward matmuls.
-
-    Returns
-    -------
-    Mixed streams of shape (..., k, d), or (..., d, k) if `streams_last`, in x's dtype.
-    """
-    if not streams_last:
-        x = jnp.swapaxes(x, -1, -2)
-    out = mhc_expand_combine(layer_output, bias, h_post, x, h_res, use_tf32)
-    return out if streams_last else jnp.swapaxes(out, -1, -2)
-
-
-def mhc(
-    x: jnp.ndarray,
-    weights: MHCWeights,
-    norm_fn: Optional[Callable[[jnp.ndarray], jnp.ndarray]],
-    branch_fn: Callable[[jnp.ndarray], Any],
-    *,
-    has_aux: bool = False,
-    norm_epsilon: float = 1e-5,
-    pre_mapping_epsilon: float = 1e-6,
-    sinkhorn_iterations: int = 20,
-    streams_last: bool = False,
-    use_tf32: bool = True,
-    use_split_k: bool = False,
-    recompute_sinkhorn_hist: bool = True,
-) -> Any:
-    """
-    Manifold-constrained hyper connection around `branch_fn`, computing the same result as
-    MaxText's `ManifoldConstrainedHyperConnections.__call__` (non-lite variant):
-
-        layer_input = norm_fn(sum_k pre[k] * x[k])
-        layer_out = branch_fn(layer_input)
-        out[m] = post[m] * layer_out + sum_k res[k, m] * x[k]
-
-    with pre = sigmoid(.) + pre_mapping_epsilon, post = 2 * sigmoid(.) and
-    res = sinkhorn(.), all generated from RMSNorm(x) by one fused projection.
-
-    Results agree with MaxText up to floating-point differences: the kernels compute the
-    mappings in fp32, and the log-space Sinkhorn omits the 1e-6 stabilizers of MaxText's
-    `sinkhorn`. Only k = 4 streams are supported.
-
-    Parameters
-    ----------
-    x : jnp.ndarray
-        Input streams of shape (..., k, d), or (..., d, k) if `streams_last`.
-    weights : MHCWeights
-        Layer parameters.
-    norm_fn : Optional[Callable]
-        Pre-normalization applied to the branch input, or None.
-    branch_fn : Callable
-        The wrapped branch (attention / MLP), called as `branch_fn(layer_input)`. MaxText's
-        mhc_type dispatch maps to e.g. `lambda y: branch(inputs_q=y, inputs_kv=y, **kwargs)[0]`.
-    has_aux : bool
-        Whether `branch_fn` returns `(layer_out, aux)`, in which case `(out, aux)` is returned.
-    norm_epsilon, pre_mapping_epsilon, sinkhorn_iterations, streams_last, use_tf32,
-    use_split_k, recompute_sinkhorn_hist :
-        See `mhc_pre` and `mhc_post`.
-
-    Returns
-    -------
-    Output streams with the layout of x, or `(output, aux)` if `has_aux`.
-    """
-    layer_input, h_post, h_res = mhc_pre(
-        x,
-        weights,
-        norm_epsilon=norm_epsilon,
-        pre_mapping_epsilon=pre_mapping_epsilon,
-        sinkhorn_iterations=sinkhorn_iterations,
-        streams_last=streams_last,
-        use_tf32=use_tf32,
-        use_split_k=use_split_k,
-        recompute_sinkhorn_hist=recompute_sinkhorn_hist,
-    )
-    if norm_fn is not None:
-        layer_input = norm_fn(layer_input)
     if has_aux:
         layer_out, aux = branch_fn(layer_input)
     else:
         layer_out, aux = branch_fn(layer_input), None
-    out = mhc_post(layer_out, x, h_post, h_res, streams_last=streams_last, use_tf32=use_tf32)
+    out = mhc_expand_combine(layer_out, None, h_post, x, h_res, use_tf32)
     return (out, aux) if has_aux else out
