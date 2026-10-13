@@ -23,11 +23,14 @@ from utils import assert_allclose, pytest_parametrize_wrapper
 
 
 @pytest.fixture(autouse=True, scope="function")
-def _inject_mhc(request):
+def _inject_mhc(request, monkeypatch):
     """Lazy-load the mHC API only for tests marked 'triton'."""
     if not request.node.get_closest_marker("triton"):
         yield
         return
+    # Triton autotuning benchmarks on each device's stream at the first run of the multi-device
+    # executable, which can deadlock with the cross-device all-reduces in a single process.
+    monkeypatch.setenv("NVTE_DISABLE_TRITON_AUTOTUNING", "1")
     from transformer_engine.jax import mhc as te_mhc
 
     mod = sys.modules[__name__]
