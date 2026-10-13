@@ -135,31 +135,31 @@ def mhc_expand_combine_ref(f, bias, h_post, x, h_res):
     return out.astype(dtype)
 
 
-def mhc_ref(x, weights, norm_fn, branch_fn, norm_epsilon, pre_mapping_epsilon, iters):
+def mhc_ref(x, params, branch_fn, norm_eps, pre_eps, iters):
     """
-    `mhc` on MaxText's (b, s, k, d) layout and weights, following the kernels' numerics:
-    RMSNorm folded into the projection, fp32 mappings and a log-space Sinkhorn.
+    `mhc` on x of shape (..., C, n), following the kernels' numerics: RMSNorm folded into the
+    projection, fp32 mappings and a log-space Sinkhorn.
     """
-    b, s, k, d = x.shape
-    w = jax.tree.map(lambda p: p.astype(jnp.float32), weights)
+    *tokens, C, n = x.shape
+    phi, alpha, beta, norm_weight = jax.tree.map(lambda p: p.astype(jnp.float32), params)
     x32 = x.astype(jnp.float32)
 
-    x_flat = x32.reshape(b, s, k * d)
+    x_flat = x32.reshape(*tokens, C * n)
     ms = jnp.mean(x_flat * x_flat, axis=-1, keepdims=True)
-    alpha = jnp.concatenate([w.pre_alpha, w.post_alpha, w.res_alpha], axis=-1)
-    h = jnp.einsum("bsm,mn->bsn", x_flat, w.norm_scale[:, None] * alpha, precision=HIGHEST)
-    h = h / jnp.sqrt(ms + norm_epsilon)
+    h = jnp.einsum("...k,nk->...n", x_flat, phi * norm_weight[None, :], precision=HIGHEST)
+    h = h / jnp.sqrt(ms + norm_eps)
 
-    pre = jax.nn.sigmoid(w.pre_scale * h[..., :k] + w.pre_bias) + pre_mapping_epsilon
-    post = 2 * jax.nn.sigmoid(w.post_scale * h[..., k : 2 * k] + w.post_bias)
-    res = mhc_sinkhorn_ref(w.res_scale * h[..., 2 * k :].reshape(b, s, k, k) + w.res_bias, iters)
+    pre = jax.nn.sigmoid(alpha[0] * h[..., :n] + beta[:n]) + pre_eps
+    post = 2 * jax.nn.sigmoid(alpha[1] * h[..., n : 2 * n] + beta[n : 2 * n])
+    res = alpha[2] * h[..., 2 * n :] + beta[2 * n :]
+    res = mhc_sinkhorn_ref(res.reshape(*tokens, n, n), iters)
 
-    layer_input = jnp.einsum("bsk,bskd->bsd", pre, x32, precision=HIGHEST)
+    layer_input = jnp.einsum("...cn,...n->...c", x32, pre, precision=HIGHEST)
     layer_input = _kernel_boundary(layer_input, x.dtype).astype(x.dtype)
-    layer_out = branch_fn(norm_fn(layer_input))
+    layer_out = branch_fn(layer_input)
     layer_out = _kernel_boundary(layer_out.astype(jnp.float32), layer_out.dtype)
-    out = layer_out[:, :, None, :] * post[..., None] + jnp.einsum(
-        "bskm,bskd->bsmd", res, x32, precision=HIGHEST
+    out = layer_out[..., :, None] * post[..., None, :] + jnp.einsum(
+        "...ck,...km->...cm", x32, res, precision=HIGHEST
     )
     return _kernel_boundary(out, x.dtype).astype(x.dtype)
 
@@ -184,30 +184,22 @@ _kernel_boundary.defvjp(
 )
 
 
-def _norm_fn(y):
-    y32 = y.astype(jnp.float32)
-    return (y32 * jax.lax.rsqrt(jnp.mean(y32 * y32, axis=-1, keepdims=True) + 1e-6)).astype(y.dtype)
-
-
 def _branch_fn(y):
-    return jnp.tanh(2 * y)
+    """A pre-norm followed by a nonlinear sub-layer."""
+    y32 = y.astype(jnp.float32)
+    y32 = y32 * jax.lax.rsqrt(jnp.mean(y32 * y32, axis=-1, keepdims=True) + 1e-6)
+    return jnp.tanh(2 * y32).astype(y.dtype)
 
 
-def _make_weights(key, k, d):
-    """MaxText-layout mHC weights in fp32."""
-    keys = jax.random.split(key, 10)
-    kd = k * d
-    return MHCWeights(
-        norm_scale=1.0 + _normal(keys[0], (kd,), jnp.float32, 0.1),
-        pre_alpha=_normal(keys[1], (kd, k), jnp.float32, kd**-0.5),
-        pre_bias=_normal(keys[2], (k,), jnp.float32, 0.5),
-        pre_scale=1.0 + _normal(keys[3], (1,), jnp.float32, 0.1),
-        post_alpha=_normal(keys[4], (kd, k), jnp.float32, kd**-0.5),
-        post_bias=_normal(keys[5], (k,), jnp.float32, 0.5),
-        post_scale=1.0 + _normal(keys[6], (1,), jnp.float32, 0.1),
-        res_alpha=_normal(keys[7], (kd, k * k), jnp.float32, kd**-0.5),
-        res_bias=_normal(keys[8], (k, k), jnp.float32, 0.5),
-        res_scale=1.0 + _normal(keys[9], (1,), jnp.float32, 0.1),
+def _make_params(key, C, n, dtype):
+    """(phi, alpha, beta, norm_weight) for x of shape (..., C, n)."""
+    keys = jax.random.split(key, 4)
+    nC = n * C
+    return (
+        _normal(keys[0], (N_MIX, nC), jnp.float32, nC**-0.5).astype(dtype),
+        (1.0 + _normal(keys[1], (3,), jnp.float32, 0.1)).astype(dtype),
+        _normal(keys[2], (N_MIX,), dtype, 0.5),
+        (1.0 + _normal(keys[3], (nC,), jnp.float32, 0.1)).astype(dtype),
     )
 
 
@@ -384,9 +376,10 @@ class TestMHCOps:
             assert_allclose(grad, ref_grad, err_msg=name, **tols)
 
 
-NORM_EPSILON = 1e-5
-PRE_MAPPING_EPSILON = 1e-6
-# (b, s, d)
+NORM_EPS = 1e-5
+PRE_EPS = 1e-6
+PARAM_NAMES = ("phi", "alpha", "beta", "norm_weight")
+# (b, s, C)
 E2E_SHAPES = {
     "L0": [(8, 32, 32), (8, 128, 1024)],
     "L1": [(8, 32, 32), (8, 128, 1024)],
@@ -396,72 +389,67 @@ E2E_SHAPES = {
 
 @pytest.mark.triton
 class TestMHC:
-    """`mhc` on MaxText-layout weights against `mhc_ref`."""
+    """`mhc` around a sub-layer against `mhc_ref`."""
 
     @staticmethod
-    def _te_mhc(x, weights, sinkhorn_iterations):
+    def _te_mhc(x, params, sinkhorn_iters):
+        phi, alpha, beta, norm_weight = params
         return mhc(
             x,
-            weights,
-            _norm_fn,
+            phi,
+            alpha,
+            beta,
             _branch_fn,
-            norm_epsilon=NORM_EPSILON,
-            pre_mapping_epsilon=PRE_MAPPING_EPSILON,
-            sinkhorn_iterations=sinkhorn_iterations,
+            norm_weight,
             use_tf32=False,
+            norm_eps=NORM_EPS,
+            pre_eps=PRE_EPS,
+            sinkhorn_iters=sinkhorn_iters,
         )
 
     @staticmethod
-    def _ref_mhc(x, weights, sinkhorn_iterations):
-        return mhc_ref(
-            x,
-            weights,
-            _norm_fn,
-            _branch_fn,
-            NORM_EPSILON,
-            PRE_MAPPING_EPSILON,
-            sinkhorn_iterations,
-        )
+    def _ref_mhc(x, params, sinkhorn_iters):
+        return mhc_ref(x, params, _branch_fn, NORM_EPS, PRE_EPS, sinkhorn_iters)
 
     @staticmethod
-    def _make_inputs(b, s, d, dtype, key):
+    def _make_inputs(b, s, C, dtype, key):
         keys = jax.random.split(key, 3)
-        x = _normal(keys[0], (b, s, N_STREAMS, d), dtype)
-        weights = jax.tree.map(lambda p: p.astype(dtype), _make_weights(keys[1], N_STREAMS, d))
-        cotangent = _normal(keys[2], (b, s, N_STREAMS, d), jnp.float32)
-        return x, weights, cotangent
+        x = _normal(keys[0], (b, s, C, N_STREAMS), dtype)
+        params = _make_params(keys[1], C, N_STREAMS, dtype)
+        cotangent = _normal(keys[2], (b, s, C, N_STREAMS), jnp.float32)
+        return x, params, cotangent
 
-    @pytest_parametrize_wrapper("b,s,d", E2E_SHAPES)
+    @pytest_parametrize_wrapper("b,s,C", E2E_SHAPES)
     @pytest_parametrize_wrapper("dtype", DTYPES)
-    @pytest_parametrize_wrapper("sinkhorn_iterations", [1, 20])
-    def test_forward(self, b, s, d, dtype, sinkhorn_iterations):
-        x, weights, _ = self._make_inputs(b, s, d, dtype, jax.random.PRNGKey(6))
-        out = jax.jit(self._te_mhc, static_argnums=2)(x, weights, sinkhorn_iterations)
-        ref = jax.jit(self._ref_mhc, static_argnums=2)(x, weights, sinkhorn_iterations)
+    @pytest_parametrize_wrapper("sinkhorn_iters", [1, 20])
+    def test_forward(self, b, s, C, dtype, sinkhorn_iters):
+        x, params, _ = self._make_inputs(b, s, C, dtype, jax.random.PRNGKey(6))
+        out = jax.jit(self._te_mhc, static_argnums=2)(x, params, sinkhorn_iters)
+        ref = jax.jit(self._ref_mhc, static_argnums=2)(x, params, sinkhorn_iters)
         assert out.shape == x.shape
         assert out.dtype == x.dtype
         assert_allclose(out, ref, **get_tols(dtype))
 
-    @pytest_parametrize_wrapper("b,s,d", E2E_SHAPES)
+    @pytest_parametrize_wrapper("b,s,C", E2E_SHAPES)
     @pytest_parametrize_wrapper("dtype", DTYPES)
-    @pytest_parametrize_wrapper("sinkhorn_iterations", [1, 20])
-    def test_backward(self, b, s, d, dtype, sinkhorn_iterations):
-        x, weights, cotangent = self._make_inputs(b, s, d, dtype, jax.random.PRNGKey(7))
+    @pytest_parametrize_wrapper("sinkhorn_iters", [1, 20])
+    def test_backward(self, b, s, C, dtype, sinkhorn_iters):
+        x, params, cotangent = self._make_inputs(b, s, C, dtype, jax.random.PRNGKey(7))
 
         def grad_of(fn):
-            def loss(x, weights):
-                out = fn(x, weights, sinkhorn_iterations)
+            def loss(x, params):
+                out = fn(x, params, sinkhorn_iters)
                 return jnp.sum(out.astype(jnp.float32) * cotangent)
 
             return jax.jit(jax.grad(loss, argnums=(0, 1)))
 
-        dx, dweights = grad_of(self._te_mhc)(x, weights)
-        ref_dx, ref_dweights = grad_of(self._ref_mhc)(x, weights)
+        dx, dparams = grad_of(self._te_mhc)(x, params)
+        ref_dx, ref_dparams = grad_of(self._ref_mhc)(x, params)
         assert dx.dtype == x.dtype
-        names = ("x",) + weights._fields
+        names = ("x",) + PARAM_NAMES
 
         if dtype == jnp.float32:
-            for name, grad, ref_grad in zip(names, (dx, *dweights), (ref_dx, *ref_dweights)):
+            for name, grad, ref_grad in zip(names, (dx, *dparams), (ref_dx, *ref_dparams)):
                 assert grad.shape == ref_grad.shape, name
                 assert_allclose(grad, ref_grad, err_msg=name, **get_tols(dtype))
             return
@@ -469,51 +457,43 @@ class TestMHC:
         # In bf16, the branch's backward and the sum of the bf16 grad_x partials amplify
         # rounding differences on a few elements, so element-wise checks are flaky. Instead,
         # TE must be about as close as the bf16 reference to an fp32 ground truth. That error
-        # is too noisy on the few-element bias and scale gradients, which are checked
+        # is too noisy on the few-element alpha and beta gradients, which are checked
         # element-wise instead.
         to_fp32 = lambda tree: jax.tree.map(lambda a: a.astype(jnp.float32), tree)
-        true_dx, true_dweights = grad_of(self._ref_mhc)(to_fp32(x), to_fp32(weights))
+        true_dx, true_dparams = grad_of(self._ref_mhc)(to_fp32(x), to_fp32(params))
 
         def rel_err(grad, truth):
             grad = grad.astype(jnp.float32)
             return float(jnp.linalg.norm(grad - truth) / (jnp.linalg.norm(truth) + FP32_EPS))
 
         for name, grad, ref_grad, truth in zip(
-            names, (dx, *dweights), (ref_dx, *ref_dweights), (true_dx, *true_dweights)
+            names, (dx, *dparams), (ref_dx, *ref_dparams), (true_dx, *true_dparams)
         ):
             assert grad.shape == truth.shape, name
-            if grad.size <= N_STREAMS * N_STREAMS:
+            if grad.size <= N_MIX:
                 assert_allclose(grad, ref_grad, err_msg=name, **get_tols(dtype))
                 continue
             te_err, ref_err = rel_err(grad, truth), rel_err(ref_grad, truth)
             assert te_err <= 2 * ref_err + 1e-3, f"{name}: TE error {te_err}, reference {ref_err}"
 
-    @pytest_parametrize_wrapper("b,s,d", [(8, 32, 32)])
-    def test_streams_last(self, b, s, d):
-        """streams_last=True on the transposed input yields the transposed output."""
-        x, weights, _ = self._make_inputs(b, s, d, jnp.float32, jax.random.PRNGKey(8))
-
-        out = jax.jit(lambda x, w: mhc(x, w, _norm_fn, _branch_fn, use_tf32=False))(x, weights)
-        out_streams_last = jax.jit(
-            lambda x, w: mhc(x, w, _norm_fn, _branch_fn, streams_last=True, use_tf32=False)
-        )(jnp.swapaxes(x, -1, -2), weights)
-
-        assert out_streams_last.shape == (b, s, d, N_STREAMS)
-        assert_allclose(jnp.swapaxes(out_streams_last, -1, -2), out, rtol=1e-5, atol=1e-5)
-
-    @pytest_parametrize_wrapper("b,s,d", [(8, 32, 32)])
-    def test_has_aux(self, b, s, d):
+    @pytest_parametrize_wrapper("b,s,C", [(8, 32, 32)])
+    def test_has_aux(self, b, s, C):
         """has_aux=True returns the branch's auxiliary output unchanged."""
-        x, weights, _ = self._make_inputs(b, s, d, jnp.float32, jax.random.PRNGKey(9))
+        x, (phi, alpha, beta, norm_weight), _ = self._make_inputs(
+            b, s, C, jnp.float32, jax.random.PRNGKey(9)
+        )
 
         def branch_with_aux(y):
             out = _branch_fn(y)
             return out, {"mean": jnp.mean(out)}
 
-        out, aux = jax.jit(
-            lambda x, w: mhc(x, w, _norm_fn, branch_with_aux, has_aux=True, use_tf32=False)
-        )(x, weights)
-        ref = jax.jit(lambda x, w: mhc(x, w, _norm_fn, _branch_fn, use_tf32=False))(x, weights)
+        def run(branch_fn, has_aux):
+            return jax.jit(
+                lambda *a: mhc(*a, branch_fn, norm_weight, has_aux=has_aux, use_tf32=False)
+            )(x, phi, alpha, beta)
+
+        out, aux = run(branch_with_aux, has_aux=True)
+        ref = run(_branch_fn, has_aux=False)
 
         assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
         assert set(aux) == {"mean"}
