@@ -218,10 +218,31 @@ def hca_compressor_batched(
     return csa_compressor_batched(kv, score, ape, batch_axes=batch_axes, ratio=ratio, coff=1)
 
 
-def _cudnn_indexer_forward(q, k, weights, *, ratio, sm_scale):
+def _cudnn_indexer_forward(q, k, weights, *, ratio, sm_scale, return_lse=False):
     from cudnn import indexer_forward_jax_sm100
 
-    return indexer_forward_jax_sm100(q, k, weights, ratio=ratio, sm_scale=sm_scale)
+    return indexer_forward_jax_sm100(
+        q, k, weights, ratio=ratio, sm_scale=sm_scale, return_lse=return_lse
+    )
+
+
+def _cudnn_dense_indexer_backward(
+    q, k, weights, attn_score, attn_l1norm, index_score, index_lse, grad_loss, *, ratio, sm_scale
+):
+    from cudnn import dense_indexer_backward_jax_sm100
+
+    return dense_indexer_backward_jax_sm100(
+        q,
+        k,
+        weights,
+        attn_score,
+        attn_l1norm,
+        index_score,
+        index_lse,
+        grad_loss,
+        ratio=ratio,
+        sm_scale=sm_scale,
+    )
 
 
 def _indexer_reference(q, k, weights, ratio, sm_scale):
@@ -298,6 +319,343 @@ def dsa_indexer_batched(
         _batch_axes_spec(batch_axes, 3),
         batch_axes,
     )(q, k, weights)
+
+
+def _cudnn_indexer_top_k(scores, seq_lens, *, top_k, tie_break):
+    from cudnn import indexer_top_k_jax_sm100
+
+    return indexer_top_k_jax_sm100(scores, seq_lens, top_k=top_k, tie_break=tie_break)
+
+
+def dsa_indexer_top_k(
+    scores: Any,
+    *,
+    top_k: int,
+    ratio: int = 4,
+    seq_lens: Any = None,
+    tie_break: int = 1,
+) -> Any:
+    """Forward-only per-row top-``top_k`` block selection over DSv4 indexer scores.
+
+    ``scores`` is ``[batch, query_length, num_blocks]``. Query ``t`` may only select its ratio-causal prefix of
+    ``min((t + 1) // ratio, num_blocks)`` blocks unless ``seq_lens`` (``[batch, query_length]`` int32, the
+    per-row valid prefix length) is given. Only that prefix is read, so no ``-inf`` masking of ``scores`` is
+    needed. Returns ``[batch, query_length, top_k]`` int32 block ids: **unsorted**, ``-1`` where a row has
+    fewer than ``top_k`` valid blocks. ``tie_break=1`` prefers the smaller block id among equal scores, as
+    ``jax.lax.top_k`` does. The result is an integer selection and carries no gradient.
+    """
+    if scores.ndim != 3:
+        raise ValueError("expected scores=[B,S,W]")
+    batch, seqlen_q, num_blocks = scores.shape
+    if top_k > num_blocks:
+        raise ValueError(f"top_k ({top_k}) exceeds the number of blocks ({num_blocks})")
+    if seq_lens is None:
+        seq_lens = jnp.minimum((jnp.arange(seqlen_q, dtype=jnp.int32) + 1) // ratio, num_blocks)
+        seq_lens = jnp.broadcast_to(seq_lens, (batch, seqlen_q))
+    elif seq_lens.shape != (batch, seqlen_q):
+        raise ValueError("seq_lens must have shape [batch, query_length]")
+    scores = jax.lax.stop_gradient(scores)
+    indices = _cudnn_indexer_top_k(
+        scores.reshape(batch * seqlen_q, num_blocks),
+        seq_lens.astype(jnp.int32).reshape(batch * seqlen_q),
+        top_k=top_k,
+        tie_break=tie_break,
+    )
+    return indices.reshape(batch, seqlen_q, top_k)
+
+
+def dsa_indexer_top_k_batched(
+    scores: Any,
+    *,
+    batch_axes: tuple[str, ...] = (),
+    top_k: int,
+    ratio: int = 4,
+    tie_break: int = 1,
+) -> Any:
+    """Run :func:`dsa_indexer_top_k` locally on each batch shard (ratio-causal prefixes)."""
+    return _batched_shard_map(
+        lambda local_scores: dsa_indexer_top_k(
+            local_scores, top_k=top_k, ratio=ratio, tie_break=tie_break
+        ),
+        (_batch_axes_spec(batch_axes, 3),),
+        _batch_axes_spec(batch_axes, 3),
+        batch_axes,
+    )(scores)
+
+
+def _ratio_causal_valid(batch, seqlen_q, seqlen_k, ratio):
+    """Blocks a query may read: block ``w`` is complete once ``(w + 1) * ratio <= position + 1``."""
+    q_positions = jnp.arange(seqlen_q)[:, None]
+    block_ends = ratio * (jnp.arange(seqlen_k)[None, :] + 1)
+    return jnp.broadcast_to(block_ends <= q_positions + 1, (batch, seqlen_q, seqlen_k))
+
+
+def _indexer_kl_sum(scores, lse, target, ratio, eps):
+    """Sum over tokens of ``KL(target || softmax(scores))`` restricted to ratio-causal blocks."""
+    valid = _ratio_causal_valid(scores.shape[0], scores.shape[1], scores.shape[2], ratio)
+    safe_lse = jnp.where(jnp.isfinite(lse), lse, 0.0)
+    log_probs = jnp.where(valid, scores - safe_lse[..., None], 0.0)
+    kl = jnp.where(valid & (target > 0.0), target * (jnp.log(target + eps) - log_probs), 0.0)
+    return jnp.sum(kl)
+
+
+def dsa_indexer_scores(
+    q: Any,
+    k: Any,
+    weights: Any,
+    *,
+    ratio: int = 4,
+    sm_scale: float = 1.0,
+) -> tuple[Any, Any]:
+    """Forward-only SM100 DSv4 indexer scores and their row log-sum-exp.
+
+    Returns ``(scores, lse)`` with ``scores`` as in :func:`dsa_indexer` and ``lse`` the ``[batch,
+    query_length]`` FP32 log-sum-exp over each row's ratio-causal blocks (``-inf`` for rows without
+    one). Inputs are stop-gradient'ed: gradients for the indexer come from
+    :func:`dsa_indexer_kl_loss`, which consumes ``scores`` and ``lse`` as residuals.
+    """
+    q, k, weights = jax.lax.stop_gradient((q, k, weights))
+    return _cudnn_indexer_forward(q, k, weights, ratio=ratio, sm_scale=sm_scale, return_lse=True)
+
+
+def dsa_indexer_scores_batched(
+    q: Any,
+    k: Any,
+    weights: Any,
+    *,
+    batch_axes: tuple[str, ...] = (),
+    ratio: int = 4,
+    sm_scale: float = 1.0,
+) -> tuple[Any, Any]:
+    """Run :func:`dsa_indexer_scores` locally on each batch shard."""
+    specs = (
+        _batch_axes_spec(batch_axes, q.ndim),
+        _batch_axes_spec(batch_axes, k.ndim),
+        _batch_axes_spec(batch_axes, weights.ndim),
+    )
+    return _batched_shard_map(
+        lambda local_q, local_k, local_weights: dsa_indexer_scores(
+            local_q, local_k, local_weights, ratio=ratio, sm_scale=sm_scale
+        ),
+        specs,
+        (_batch_axes_spec(batch_axes, 3), _batch_axes_spec(batch_axes, 2)),
+        batch_axes,
+    )(q, k, weights)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8))
+def _dsa_indexer_kl_loss(q, k, weights, scores, lse, target, ratio, sm_scale, eps):
+    del q, k, weights
+    return _indexer_kl_sum(scores, lse, target, ratio, eps)
+
+
+def _dsa_indexer_kl_loss_fwd(q, k, weights, scores, lse, target, ratio, sm_scale, eps):
+    loss = _indexer_kl_sum(scores, lse, target, ratio, eps)
+    return loss, (q, k, weights, scores, lse, target)
+
+
+def _dsa_indexer_kl_loss_bwd(ratio, sm_scale, eps, residual, grad_kl_sum):
+    del eps
+    q, k, weights, scores, lse, target = residual
+    batch, seqlen_q = q.shape[:2]
+    # The cuDNN kernel scales every token's KL gradient by ``grad_loss / (B * S_q)``; a unit weight per
+    # token (the cotangent of a plain sum) therefore needs ``grad_loss = cotangent * B * S_q``.
+    grad_loss = (grad_kl_sum.astype(jnp.float32) * (batch * seqlen_q)).reshape(1)
+    grad_q, grad_weights, grad_k = _cudnn_dense_indexer_backward(
+        q,
+        k,
+        weights,
+        target.astype(jnp.float32),
+        # ``target`` is already normalized, so the kernel's ``attn_score / attn_l1norm`` is ``target``.
+        jnp.ones(lse.shape, jnp.float32),
+        scores,
+        lse,
+        grad_loss,
+        ratio=ratio,
+        sm_scale=sm_scale,
+    )
+    return grad_q, grad_k.astype(k.dtype).reshape(k.shape), grad_weights, None, None, None
+
+
+_dsa_indexer_kl_loss.defvjp(_dsa_indexer_kl_loss_fwd, _dsa_indexer_kl_loss_bwd)
+
+
+def dsa_indexer_kl_loss(
+    q: Any,
+    k: Any,
+    weights: Any,
+    scores: Any,
+    lse: Any,
+    target: Any,
+    *,
+    ratio: int = 4,
+    sm_scale: float = 1.0,
+    eps: float = 1e-8,
+) -> Any:
+    """Summed dense DSv4 indexer KL loss with a fused cuDNN backward.
+
+    Returns ``sum_t KL(target_t || softmax(scores_t))`` over every query token and ratio-causal
+    block, with ``KL = sum_w target * (log(target + eps) - log_softmax(scores))``. ``scores`` and
+    ``lse`` are the outputs of :func:`dsa_indexer_scores` for the same ``q``, ``k`` and ``weights``;
+    ``target`` is a constant ``[batch, query_length, blocks]`` FP32 distribution (zero outside the
+    ratio-causal blocks).
+
+    Only ``q``, ``k`` and ``weights`` receive gradients. The VJP calls the cuDNN dense indexer-backward
+    kernel, which fuses the KL gradient with the three indexer GEMMs, instead of differentiating
+    through the scores. Dense (full-block) loss only; the query position is its index, i.e. no
+    packed-sequence position resets.
+    """
+    return _dsa_indexer_kl_loss(q, k, weights, scores, lse, target, ratio, sm_scale, eps)
+
+
+def dsa_indexer_kl_loss_batched(
+    q: Any,
+    k: Any,
+    weights: Any,
+    scores: Any,
+    lse: Any,
+    target: Any,
+    *,
+    batch_axes: tuple[str, ...] = (),
+    ratio: int = 4,
+    sm_scale: float = 1.0,
+    eps: float = 1e-8,
+) -> Any:
+    """Run :func:`dsa_indexer_kl_loss` locally on each batch shard.
+
+    Returns one partial sum per batch shard (shape ``[1]`` without sharding). The caller adds them and
+    applies its own token normalization, which keeps the VJP exact without a collective inside the
+    manual region.
+    """
+    arrays = (q, k, weights, scores, lse, target)
+    specs = tuple(_batch_axes_spec(batch_axes, array.ndim) for array in arrays)
+    return _batched_shard_map(
+        lambda *local: dsa_indexer_kl_loss(*local, ratio=ratio, sm_scale=sm_scale, eps=eps).reshape(
+            1
+        ),
+        specs,
+        _batch_axes_spec(batch_axes, 1),
+        batch_axes,
+    )(*arrays)
+
+
+def _cudnn_sparse_indexer_backward(
+    q, k, weights, attn_score, index_score, topk_indices, grad_loss, *, sm_scale
+):
+    from cudnn import sparse_indexer_backward_jax_sm100
+
+    return sparse_indexer_backward_jax_sm100(
+        q, k, weights, attn_score, index_score, topk_indices, grad_loss, sm_scale=sm_scale
+    )
+
+
+def _sparse_student_log_probs(scores, topk_indices):
+    """Log-softmax of the dense ``scores`` over each row's selected, valid (``>= 0``) slots.
+
+    Returns ``(log_probs, valid)`` of shape ``[batch, query_length, selected]``; invalid slots (and every slot
+    of a row without a valid one) get ``0``.
+    """
+    valid = topk_indices >= 0
+    logits = jnp.take_along_axis(scores, jnp.maximum(topk_indices, 0), axis=-1)
+    any_valid = jnp.any(valid, axis=-1, keepdims=True)
+    logits = jnp.where(any_valid & valid, logits, jnp.where(any_valid, -jnp.inf, 0.0))
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    return jnp.where(valid, log_probs, 0.0), valid
+
+
+def _sparse_indexer_kl_sum(log_probs, valid, target, eps):
+    kl = jnp.where(valid & (target > 0.0), target * (jnp.log(target + eps) - log_probs), 0.0)
+    return jnp.sum(kl)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7))
+def _dsa_indexer_sparse_kl_loss(q, k, weights, scores, topk_indices, target, sm_scale, eps):
+    del q, k, weights
+    log_probs, valid = _sparse_student_log_probs(scores, topk_indices)
+    return _sparse_indexer_kl_sum(log_probs, valid, target, eps)
+
+
+def _dsa_indexer_sparse_kl_loss_fwd(q, k, weights, scores, topk_indices, target, sm_scale, eps):
+    log_probs, valid = _sparse_student_log_probs(scores, topk_indices)
+    loss = _sparse_indexer_kl_sum(log_probs, valid, target, eps)
+    probs = jnp.where(valid, jnp.exp(log_probs), 0.0)
+    return loss, (q, k, weights, probs, topk_indices, target)
+
+
+def _dsa_indexer_sparse_kl_loss_bwd(sm_scale, eps, residual, grad_kl_sum):
+    del eps
+    q, k, weights, probs, topk_indices, target = residual
+    batch, seqlen_q = q.shape[:2]
+    # The cuDNN kernel scales every token's KL gradient by ``grad_loss / (B * S_q)``; a unit weight per
+    # token (the cotangent of a plain sum) therefore needs ``grad_loss = cotangent * B * S_q``.
+    grad_loss = (grad_kl_sum.astype(jnp.float32) * (batch * seqlen_q)).reshape(1)
+    grad_q, grad_weights, grad_k = _cudnn_sparse_indexer_backward(
+        q,
+        k,
+        weights,
+        target.astype(jnp.float32),
+        probs.astype(jnp.float32),
+        topk_indices.astype(jnp.int32),
+        grad_loss,
+        sm_scale=sm_scale,
+    )
+    return grad_q, grad_k.astype(k.dtype).reshape(k.shape), grad_weights, None, None, None
+
+
+_dsa_indexer_sparse_kl_loss.defvjp(_dsa_indexer_sparse_kl_loss_fwd, _dsa_indexer_sparse_kl_loss_bwd)
+
+
+def dsa_indexer_sparse_kl_loss(
+    q: Any,
+    k: Any,
+    weights: Any,
+    scores: Any,
+    topk_indices: Any,
+    target: Any,
+    *,
+    sm_scale: float = 1.0,
+    eps: float = 1e-8,
+) -> Any:
+    """Summed sparse DSv4 indexer KL loss with a fused cuDNN backward.
+
+    Returns ``sum_t KL(target_t || softmax(scores_t[selected_t]))`` where the softmax runs over each query's
+    selected blocks only. ``scores`` is the dense ``[batch, query_length, blocks]`` output of
+    :func:`dsa_indexer_scores` (or :func:`dsa_indexer`) for the same ``q``, ``k`` and ``weights``;
+    ``topk_indices`` is ``[batch, query_length, selected]`` int32 block ids local to each batch element
+    (``-1`` marks an invalid slot; ``selected`` must be 512); ``target`` is the constant
+    FP32 teacher over the same slots, L1-normalized over the valid ones.
+
+    Only ``q``, ``k`` and ``weights`` receive gradients, computed by the cuDNN sparse indexer-backward
+    kernel. The query position is its index, i.e. no packed-sequence position resets.
+    """
+    return _dsa_indexer_sparse_kl_loss(q, k, weights, scores, topk_indices, target, sm_scale, eps)
+
+
+def dsa_indexer_sparse_kl_loss_batched(
+    q: Any,
+    k: Any,
+    weights: Any,
+    scores: Any,
+    topk_indices: Any,
+    target: Any,
+    *,
+    batch_axes: tuple[str, ...] = (),
+    sm_scale: float = 1.0,
+    eps: float = 1e-8,
+) -> Any:
+    """Run :func:`dsa_indexer_sparse_kl_loss` locally on each batch shard.
+
+    Returns one partial sum per batch shard (shape ``[1]`` without sharding); see
+    :func:`dsa_indexer_kl_loss_batched` for why the caller normalizes.
+    """
+    arrays = (q, k, weights, scores, topk_indices, target)
+    specs = tuple(_batch_axes_spec(batch_axes, array.ndim) for array in arrays)
+    return _batched_shard_map(
+        lambda *local: dsa_indexer_sparse_kl_loss(*local, sm_scale=sm_scale, eps=eps).reshape(1),
+        specs,
+        _batch_axes_spec(batch_axes, 1),
+        batch_axes,
+    )(*arrays)
 
 
 def _cudnn_sparse_attention_forward(
@@ -475,6 +833,14 @@ __all__ = [
     "csa_compressor_batched",
     "dsa_indexer",
     "dsa_indexer_batched",
+    "dsa_indexer_kl_loss",
+    "dsa_indexer_kl_loss_batched",
+    "dsa_indexer_sparse_kl_loss",
+    "dsa_indexer_sparse_kl_loss_batched",
+    "dsa_indexer_scores",
+    "dsa_indexer_scores_batched",
+    "dsa_indexer_top_k",
+    "dsa_indexer_top_k_batched",
     "dsa_sparse_attention",
     "dsa_sparse_attention_batched",
     "hca_compressor_batched",
