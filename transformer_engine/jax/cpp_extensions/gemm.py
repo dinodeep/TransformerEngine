@@ -1003,7 +1003,11 @@ class GemmPrimitive(BasePrimitive):
             lhs_cspecs = (None,) * len(lhs_cspecs)
             rhs_cspecs = (None,) * len(rhs_cspecs)
 
-            # Non-contracting dims of RHS always needs to be gathered along the FSDP axis
+            # Non-contracting dims of RHS always needs to be gathered along the FSDP axis, and
+            # along any axis that also shards a non-contracting dim of LHS (e.g. an FSDP-like
+            # axis that shards both the weight and the activation batch). Otherwise the LHS
+            # would be gathered below instead, which is far more traffic for activations.
+            lhs_non_c_axes = {a for s in lhs_non_cspecs for a in _convert_axis_spec_to_list(s)}
             rhs_non_cspecs = tuple(
                 (
                     None
@@ -1011,6 +1015,7 @@ class GemmPrimitive(BasePrimitive):
                     and (
                         spec == gsr.fsdp_resource
                         or (isinstance(spec, tuple) and gsr.fsdp_resource in spec)
+                        or any(a in lhs_non_c_axes for a in _convert_axis_spec_to_list(spec))
                     )
                     else spec
                 )
