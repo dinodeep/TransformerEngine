@@ -86,19 +86,23 @@ def dense(
         output_axes: Logical axes for sharding the output
         collective_op_set: A set of CollectiveOp objects for forward and backward passes.
         quantizer_set: QuantizerSet which contains quantizers for different tensor types
-        kernel_amax: Optional precomputed amax (max |kernel|) of the whole, unsharded kernel, as a float32
-            scalar or [1] array. Only valid with current tensor scaling of the kernel. When given, the kernel
-            is quantized with this amax instead of computing it (and all-reducing it across FSDP) on every
-            call, e.g. when the caller computes the amax of fixed weights once per training step. It is
-            treated as a constant: its gradient is zero.
+        kernel_amax: Optional precomputed amax (max |kernel|) of the whole, unsharded kernel, as
+            a float32 scalar or [1] array. Only valid with current tensor scaling of the kernel.
+            When given, the kernel is quantized with this amax instead of computing it (and
+            all-reducing it across FSDP) on every call, e.g. when the caller computes the amax of
+            fixed weights once per training step. It is treated as a constant: its gradient is zero.
 
     Returns:
         Transformed output tensor
     """
     if kernel_amax is not None:
-        kernel_quantizer = getattr(quantizer_set, "kernel", None)
-        if kernel_quantizer is None or kernel_quantizer.scaling_mode != ScalingMode.CURRENT_TENSOR_SCALING:
-            raise ValueError("kernel_amax is only supported with current tensor scaling of the kernel.")
+        if (
+            quantizer_set.kernel is None
+            or quantizer_set.kernel.scaling_mode != ScalingMode.CURRENT_TENSOR_SCALING
+        ):
+            raise ValueError(
+                "kernel_amax is only supported with current tensor scaling of the kernel."
+            )
         kernel_amax = jax.lax.stop_gradient(jnp.reshape(kernel_amax, (1,)).astype(jnp.float32))
 
     if transpose_batch_sequence:
