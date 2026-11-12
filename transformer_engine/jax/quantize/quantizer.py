@@ -254,7 +254,7 @@ class CurrentScaleQuantizer(Quantizer):
 
         compute_dtype = jnp.float32
         dtype_max = (jnp.finfo(self.q_dtype).max).astype(compute_dtype)
-        amax = x.amax or jnp.max(jnp.abs(x.data)).reshape((1,))
+        amax = x.amax if x.amax is not None else jnp.max(jnp.abs(x.data)).reshape((1,))
         scale = compute_scale_from_amax(amax, self.q_dtype, margin=0.0)
         scaled_x = x.data.astype(compute_dtype) * scale
 
