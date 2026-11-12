@@ -23,6 +23,8 @@ from .quantize import (
     noop_quantizer_set,
     with_sharding_constraint_by_logical_axes,
     TensorUsage,
+    NoScaleTensor,
+    ScalingMode,
 )
 
 
@@ -65,6 +67,7 @@ def dense(
     output_axes: Tuple[str, ...] = None,
     collective_op_set: tex.CollectiveOpSet = tex.noop_collective_op_set,
     quantizer_set: QuantizerSet = noop_quantizer_set,
+    kernel_amax: jnp.ndarray = None,
 ):
     """Perform dense layer transformation with optional quantization.
 
@@ -83,10 +86,21 @@ def dense(
         output_axes: Logical axes for sharding the output
         collective_op_set: A set of CollectiveOp objects for forward and backward passes.
         quantizer_set: QuantizerSet which contains quantizers for different tensor types
+        kernel_amax: Optional precomputed amax (max |kernel|) of the whole, unsharded kernel, as a float32
+            scalar or [1] array. Only valid with current tensor scaling of the kernel. When given, the kernel
+            is quantized with this amax instead of computing it (and all-reducing it across FSDP) on every
+            call, e.g. when the caller computes the amax of fixed weights once per training step. It is
+            treated as a constant: its gradient is zero.
 
     Returns:
         Transformed output tensor
     """
+    if kernel_amax is not None:
+        kernel_quantizer = getattr(quantizer_set, "kernel", None)
+        if kernel_quantizer is None or kernel_quantizer.scaling_mode != ScalingMode.CURRENT_TENSOR_SCALING:
+            raise ValueError("kernel_amax is only supported with current tensor scaling of the kernel.")
+        kernel_amax = jax.lax.stop_gradient(jnp.reshape(kernel_amax, (1,)).astype(jnp.float32))
+
     if transpose_batch_sequence:
         warnings.warn("transpose_batch_sequence is not well tested, use with caution!")
 
@@ -112,6 +126,7 @@ def dense(
         output_axes,
         collective_op_set,
         quantizer_set,
+        kernel_amax,
     )
     return output
 
@@ -128,6 +143,7 @@ def _dense(
     output_axes,
     collective_op_set,
     quantizer_set,  # need to be a diff_arg for DelayedScaling state management
+    kernel_amax=None,  # optional precomputed kernel amax (see `dense`); zero cotangent
 ):
     """Internal implementation of dense layer transformation with custom VJP.
 
@@ -145,6 +161,7 @@ def _dense(
         kernel_axes: Logical axes for sharding the weight matrix
         collective_op_set: A set of CollectiveOp objects for forward and backward passes.
         quantizer_set: QuantizerSet which contains quantizers for different tensor types
+        kernel_amax: Optional precomputed kernel amax, see `dense`
 
     Returns:
         Transformed output tensor
@@ -160,6 +177,7 @@ def _dense(
         output_axes,
         collective_op_set,
         quantizer_set,
+        kernel_amax,
     )
     return output
 
@@ -175,6 +193,7 @@ def _dense_fwd_rule(
     output_axes,
     collective_op_set,
     quantizer_set,
+    kernel_amax=None,
 ):
     """Forward pass rule for dense layer transformation.
 
@@ -204,8 +223,10 @@ def _dense_fwd_rule(
     )
     casted_x = with_sharding_constraint_by_logical_axes(casted_x, input_axes)
 
+    # A precomputed amax skips the per-call amax computation and its FSDP all-reduce.
+    kernel_in = kernel if kernel_amax is None else NoScaleTensor(data=kernel, amax=kernel_amax)
     casted_kernel = tex.quantize(
-        kernel,
+        kernel_in,
         flatten_axis=flatten_axis_k,
         quantizer=quantizer_set.kernel,
         amax_scope=AmaxScope.FSDP,
@@ -232,6 +253,7 @@ def _dense_fwd_rule(
         quantizer_set,
         flatten_axis_k,
         has_bias,
+        kernel_amax,
     )
     return output, ctx
 
@@ -259,6 +281,7 @@ def _dense_bwd_rule(
         quantizer_set,
         flatten_axis_k,
         has_bias,
+        kernel_amax,
     ) = ctx
     grad = with_sharding_constraint_by_logical_axes(grad, output_axes)
 
@@ -309,7 +332,8 @@ def _dense_bwd_rule(
     dgrad = with_sharding_constraint_by_logical_axes(dgrad, input_axes)
     wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)
 
-    return dgrad, wgrad, dbias, quantizer_set
+    damax = None if kernel_amax is None else jnp.zeros_like(kernel_amax)
+    return dgrad, wgrad, dbias, quantizer_set, damax
 
 
 _dense.defvjp(_dense_fwd_rule, _dense_bwd_rule)
