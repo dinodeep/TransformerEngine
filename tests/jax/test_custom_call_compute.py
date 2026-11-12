@@ -1536,6 +1536,75 @@ class TestDense:
         assert_allclose(primitive_w_grad, ref_w_grad, dtype=quantizer_set.dgrad.q_dtype)
         assert_allclose(primitive_bias_grad, ref_bias_grad, dtype=quantizer_set.dgrad.q_dtype)
 
+    @pytest.mark.skipif(not is_fp8_supported, reason=fp8_unsupported_reason)
+    @pytest_parametrize_wrapper("m,n,k", [(64, 128, 128)])
+    @pytest_parametrize_wrapper("amax_shape", [(), (1,)])
+    @pytest_parametrize_wrapper("with_jax_gemm", [False, True])
+    def test_dense_grad_with_precomputed_kernel_amax(self, m, n, k, amax_shape, with_jax_gemm):
+        """A precomputed kernel amax must give bitwise-identical outputs and gradients to the
+        amax that dense() computes inline with current tensor scaling."""
+        data_layout = "NN"
+        x, w, contracting_dims = self._generate_gemm_input(m, n, k, data_layout)
+
+        key = jax.random.PRNGKey(1)
+        bias = jax.random.uniform(key, n, dtype=jnp.bfloat16)
+
+        quantizer_set = QuantizerFactory.create_set(
+            scaling_mode=ScalingMode.CURRENT_TENSOR_SCALING,
+            fwd_dtype=jnp.float8_e4m3fn,
+            bwd_dtype=jnp.float8_e5m2,
+        )
+
+        def primitive_func(x, w, bias, kernel_amax):
+            primitive_out = dense(
+                x,
+                w,
+                bias,
+                contracting_dims=contracting_dims,
+                quantizer_set=quantizer_set,
+                kernel_amax=kernel_amax,
+            )
+            return jnp.mean(primitive_out), primitive_out
+
+        value_n_grad_func = jit(value_and_grad(primitive_func, (0, 1, 2, 3), has_aux=True))
+        kernel_amax = jnp.max(jnp.abs(w)).astype(jnp.float32).reshape(amax_shape)
+
+        with use_jax_gemm(enabled=with_jax_gemm):
+            (_, ref_out), ref_grads = value_n_grad_func(x, w, bias, None)
+            (_, out), grads = value_n_grad_func(x, w, bias, kernel_amax)
+            # A different amax must change the result, i.e. the precomputed amax is used.
+            # 3x is not a power of 2, so the scaled FP8 values are not just shifted in exponent.
+            (_, other_out), _ = value_n_grad_func(x, w, bias, 3.0 * kernel_amax)
+
+        assert jnp.array_equal(out, ref_out)
+        for grad, ref_grad in zip(grads[:3], ref_grads[:3]):
+            assert jnp.array_equal(grad, ref_grad)
+        # The amax is treated as a constant
+        assert grads[3].shape == kernel_amax.shape
+        assert jnp.array_equal(grads[3], jnp.zeros_like(kernel_amax))
+        assert not jnp.array_equal(other_out, ref_out)
+
+    @pytest.mark.skipif(not is_fp8_supported, reason=fp8_unsupported_reason)
+    @pytest_parametrize_wrapper(
+        "scaling_mode",
+        [ScalingMode.NO_SCALING]
+        + [s for s in supported_scaling_modes if s != ScalingMode.CURRENT_TENSOR_SCALING],
+    )
+    def test_dense_kernel_amax_rejected_without_current_scaling(self, scaling_mode):
+        x, w, contracting_dims = self._generate_gemm_input(64, 128, 128, "NN")
+        if scaling_mode == ScalingMode.NO_SCALING:
+            quantizer_set = noop_quantizer_set
+        else:
+            quantizer_set = QuantizerFactory.create_set(scaling_mode=scaling_mode)
+        with pytest.raises(ValueError, match="kernel_amax is only supported"):
+            dense(
+                x,
+                w,
+                contracting_dims=contracting_dims,
+                quantizer_set=quantizer_set,
+                kernel_amax=jnp.max(jnp.abs(w)).astype(jnp.float32),
+            )
+
 
 @pytest.fixture(name="random_inputs")
 def random_inputs_fixture(shape):
