@@ -850,6 +850,33 @@ class TestQuantize:
             ),
         )
 
+    def test_jax_quantize_with_traced_amax_jitted(
+        self, in_dtype, input_shape, q_dtype, scaling_mode, q_layout, flatten_axis
+    ):
+        """A NoScaleTensor carrying a traced amax quantizes under jit like a plain array."""
+        if scaling_mode not in (
+            ScalingMode.CURRENT_TENSOR_SCALING,
+            ScalingMode.DELAYED_TENSOR_SCALING,
+        ):
+            pytest.skip("Only tensor scaling quantizers accept an input amax")
+        self._skip_unsupported_dtypes(q_dtype, scaling_mode)
+
+        key = jax.random.PRNGKey(0)
+        input = jax.random.uniform(key, input_shape, in_dtype)
+        amax = jnp.max(jnp.abs(input)).astype(jnp.float32).reshape((1,))
+
+        quantizer, ref_quantizer = QuantizerFactory.create(
+            n_quantizers=2, q_dtype=q_dtype, scaling_mode=scaling_mode, q_layout=q_layout
+        )
+
+        jax_impl_func_jit = jax.jit(_jax_quantize, static_argnums=(2, 3))
+        output = jax_impl_func_jit(
+            NoScaleTensor(data=input, amax=amax), quantizer=quantizer, flatten_axis=flatten_axis
+        )
+        ref_output = jax_impl_func_jit(input, quantizer=ref_quantizer, flatten_axis=flatten_axis)
+
+        assert_bitwise_scaled_tensors(output, ref_output)
+
 
 @pytest_parametrize_wrapper("in_dtype", [jnp.bfloat16])
 @pytest_parametrize_wrapper("q_dtype", [jnp.float4_e2m1fn])

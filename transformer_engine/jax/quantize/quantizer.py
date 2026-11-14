@@ -392,7 +392,7 @@ class DelayedScaleQuantizer(CurrentScaleQuantizer):
 
         clipped_scaled_x = jnp.clip(scaled_x, -dtype_max, dtype_max).astype(self.q_dtype)
         scale_inv = 1.0 / self.scale
-        amax = x.amax or jnp.max(jnp.abs(x.data)).reshape((1,))
+        amax = x.amax if x.amax is not None else jnp.max(jnp.abs(x.data)).reshape((1,))
         # Note, this updating of amax here will only be called once because the "quantize" method impl inherited from CurrentScaleQuantizer only calls _quantize_func once then transposes the result for colwise quantization. So we don't have to worry about update being called twice for 2x2x quantization.
         self.update(amax)
         return ScaledTensorFactory.create_1x(
