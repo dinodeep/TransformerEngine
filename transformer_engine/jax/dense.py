@@ -91,6 +91,10 @@ def dense(
             When given, the kernel is quantized with this amax instead of computing it (and
             all-reducing it across FSDP) on every call, e.g. when the caller computes the amax of
             fixed weights once per training step. It is treated as a constant: its gradient is zero.
+            The inline amax is reduced across FSDP only, so a kernel that is also sharded across
+            tensor parallelism gets one scale per TP shard, while a whole-kernel amax gives all
+            shards one scale. Both are valid current scaling; the result matches the inline path
+            exactly unless the kernel is sharded across tensor parallelism.
 
     Returns:
         Transformed output tensor
