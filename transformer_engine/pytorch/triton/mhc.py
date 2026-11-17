@@ -649,6 +649,8 @@ class mHCProjectionOp(torch.autograd.Function):
                 BLOCK_SIZE_N=32,
                 precision="tf32" if ctx.use_tf32 else "ieee",
                 USE_SPLIT_M=ctx.use_split_k,
+                # The TMA path is only exercised (and validated) from JAX so far.
+                USE_TMA=False,
             )
 
             grad_phi = grad_phi.to(phi.dtype)
@@ -663,8 +665,8 @@ class mHCProjectionOp(torch.autograd.Function):
 
         # pylint: disable=unnecessary-lambda-assignment
         grid = lambda META: (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]),
             triton.cdiv(K, META["BLOCK_SIZE_K"]),
+            META["NUM_M_PROGS"],
         )
 
         _mhc_projection_bwd_fused_dx[grid](
@@ -693,6 +695,8 @@ class mHCProjectionOp(torch.autograd.Function):
             precision=ctx.precision,
             FUSE_GRAD_X_ACC=ctx.fused_grad_x_acc_buffer is not None,
             HAS_NORM_WEIGHT=norm_weight is not None,
+            # The TMA path is only exercised (and validated) from JAX so far.
+            USE_TMA=False,
         )
 
         return grad_x.to(x.dtype), grad_phi, grad_norm_weight, None, None, None
