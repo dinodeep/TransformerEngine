@@ -21,6 +21,7 @@ from transformer_engine.common.triton.mhc import (
     _mhc_projection_fwd_fused,
     _mhc_projection_bwd_fused_dx,
     _mhc_projection_bwd_fused_dphi,
+    _mhc_bwd_fused_dx_dphi,
     _mhc_scale_fwd_fused,
     _mhc_scale_bwd_fused,
     _mhc_sinkhorn_fwd_fused_recompute,
@@ -41,6 +42,7 @@ from .utils import triton_call_lowering
 __all__ = [
     "mhc_projection_fwd",
     "mhc_projection_bwd",
+    "mhc_bwd_fused_dx_dphi",
     "mhc_scale_fwd",
     "mhc_scale_bwd",
     "mhc_sinkhorn_fwd",
@@ -587,6 +589,168 @@ class MHCProjectionBwdDphiPrimitive(_MHCPrimitive):
 register_primitive(MHCProjectionBwdDphiPrimitive)
 
 
+# Partial grad_psi rows written by `_mhc_bwd_fused_dx_dphi` (= its grid size along M). It sizes the
+# workspace, so it is fixed here instead of autotuned (GB300: 2 and 4 are equally fast, 8 is +4 %).
+BWD_FUSED_NUM_M_PROGS = int(os.environ.get("NVTE_MHC_BWD_FUSED_M_PROGS", "4"))
+
+
+class MHCBwdFusedDxDphiPrimitive(_MHCPrimitive):
+    """Total x gradient of an mHC block and grad_psi = grad_H^T @ x in one pass over x.
+
+    grad_x = 2 * x * grad_ms / K + grad_H @ (phi * norm_weight)
+             [+ grad_agg (x) H_pre]  [+ grad_x_add]
+    """
+
+    name = "te_mhc_bwd_fused_dx_dphi_triton"
+    # precision, precision_dphi, has_norm_weight, has_agg, has_add, has_dphi, num_m_progs
+    impl_static_args = (8, 9, 10, 11, 12, 13, 14)
+    reduced_outputs = (1,)
+
+    @staticmethod
+    def layouts(
+        precision, precision_dphi, has_norm_weight, has_agg, has_add, has_dphi, num_m_progs
+    ):
+        del precision, precision_dphi, has_norm_weight, has_dphi, num_m_progs
+        agg = 1 if has_agg else None
+        return (1, None, None, 1, 0, agg, agg, 1 if has_add else None), (1, None)
+
+    @staticmethod
+    def abstract(*avals, **kwargs):
+        """Inner abstract: grad_x and grad_psi are aliased to their buffers."""
+        del kwargs
+        grad_x_aval, grad_psi_aval = avals[8], avals[9]
+        return (
+            jax.core.ShapedArray(grad_x_aval.shape, grad_x_aval.dtype),
+            jax.core.ShapedArray(grad_psi_aval.shape, grad_psi_aval.dtype),
+        )
+
+    @staticmethod
+    def outer_abstract(*avals, has_dphi, num_m_progs, **kwargs):
+        """Outer abstract: grad_x of x's shape and dtype, fp32 (num_m_progs, 32, K) partials."""
+        del kwargs
+        x_aval = avals[0]
+        K = x_aval.shape[-1]
+        psi_shape = (num_m_progs, H_PADDED_DIM, K) if has_dphi else (1,)
+        return (
+            jax.core.ShapedArray(x_aval.shape, x_aval.dtype),
+            jax.core.ShapedArray(psi_shape, jnp.float32),
+        )
+
+    @staticmethod
+    def impl(
+        x,
+        phi,
+        norm_weight,
+        grad_h,
+        grad_ms,
+        grad_agg,
+        h_pre,
+        grad_x_add,
+        precision,
+        precision_dphi,
+        has_norm_weight,
+        has_agg,
+        has_add,
+        has_dphi,
+        num_m_progs,
+    ):
+        """Flatten the token dims, allocate the outputs and call the inner primitive."""
+        assert MHCBwdFusedDxDphiPrimitive.inner_primitive is not None
+        x_2d = _flatten_tokens(x, 1)
+        M, K = x_2d.shape
+        n = 4
+        grad_x, grad_psi = MHCBwdFusedDxDphiPrimitive.inner_primitive.bind(
+            x_2d,
+            phi,
+            norm_weight,
+            grad_h.reshape(M, H_PADDED_DIM),
+            grad_ms.reshape(M),
+            grad_agg.reshape(M, K // n) if has_agg else grad_agg,
+            h_pre.reshape(M, n) if has_agg else h_pre,
+            grad_x_add.reshape(M, K) if has_add else grad_x_add,
+            jnp.empty((M, K), dtype=x.dtype),
+            (
+                jnp.empty((num_m_progs, H_PADDED_DIM, K), dtype=jnp.float32)
+                if has_dphi
+                else _empty_aliased(jnp.float32)
+            ),
+            precision=precision,
+            precision_dphi=precision_dphi,
+            has_norm_weight=has_norm_weight,
+            has_agg=has_agg,
+            has_add=has_add,
+            has_dphi=has_dphi,
+            num_m_progs=num_m_progs,
+        )
+        return grad_x.reshape(x.shape), grad_psi
+
+    @staticmethod
+    def lowering(
+        ctx,
+        x,
+        phi,
+        norm_weight,
+        grad_h,
+        grad_ms,
+        grad_agg,
+        h_pre,
+        grad_x_add,
+        grad_x,
+        grad_psi,
+        *,
+        precision,
+        precision_dphi,
+        has_norm_weight,
+        has_agg,
+        has_add,
+        has_dphi,
+        num_m_progs,
+    ):
+        """MLIR lowering using triton_call_lowering."""
+        M, K = ctx.avals_in[0].shape
+        N = ctx.avals_in[1].shape[0]
+
+        def grid(meta):
+            return (triton.cdiv(K, meta["BLOCK_SIZE_K"]), num_m_progs)
+
+        return triton_call_lowering(
+            ctx,
+            _mhc_bwd_fused_dx_dphi,
+            x,
+            phi,
+            norm_weight,
+            grad_h,
+            grad_ms,
+            grad_agg,
+            h_pre,
+            grad_x_add,
+            grad_x,
+            grad_psi,
+            grid=grid,
+            input_output_aliases={8: 0, 9: 1},
+            constexprs={
+                "M": M,
+                "N": N,
+                "K": K,
+                "n": 4,
+                "BLOCK_SIZE_N": H_PADDED_DIM,
+                "NUM_M_PROGS": num_m_progs,
+                "precision": precision,
+                "precision_dphi": precision_dphi,
+                "HAS_NORM_WEIGHT": has_norm_weight,
+                "HAS_AGG": has_agg,
+                "HAS_ADD": has_add,
+                "HAS_DPHI": has_dphi,
+                # TMA loads of x, grad_H and grad_x_add and TMA store of grad_x (same gate as the
+                # projection kernels; grad_x_add has x's shape and dtype).
+                "USE_TMA": _projection_fwd_use_tma(ctx.avals_in[0], ctx.avals_in[1]),
+            },
+        )
+
+
+register_primitive(MHCBwdFusedDxDphiPrimitive)
+
+
 class MHCScaleFwdPrimitive(_MHCPrimitive):
     """RMSNorm scaling, bias and activations producing [H_pre, H_post, H_res] (padded to 32)."""
 
@@ -1062,12 +1226,12 @@ class MHCAggregateBwdPrimitive(_MHCPrimitive):
     """grad_x = grad_out * H_pre and grad_H_pre = sum_C(grad_out * x)."""
 
     name = "te_mhc_aggregate_bwd_triton"
-    impl_static_args = (4, 5)  # precision, fuse_grad_x_acc
+    impl_static_args = (4, 5, 6)  # precision, fuse_grad_x_acc, write_grad_x
 
     @staticmethod
-    def layouts(precision, fuse_grad_x_acc):
+    def layouts(precision, fuse_grad_x_acc, write_grad_x):
         del precision
-        return (1, 2, 1, 2 if fuse_grad_x_acc else None), (2, 1)
+        return (1, 2, 1, 2 if fuse_grad_x_acc else None), (2 if write_grad_x else None, 1)
 
     @staticmethod
     def abstract(
@@ -1079,9 +1243,10 @@ class MHCAggregateBwdPrimitive(_MHCPrimitive):
         *,
         precision,
         fuse_grad_x_acc,
+        write_grad_x,
     ):
         """Inner abstract: grad_H_pre and grad_x are aliased to their buffers."""
-        del grad_out_aval, h_pre_aval, x_aval, precision, fuse_grad_x_acc
+        del grad_out_aval, h_pre_aval, x_aval, precision, fuse_grad_x_acc, write_grad_x
         return (
             jax.core.ShapedArray(grad_h_pre_aval.shape, grad_h_pre_aval.dtype),
             jax.core.ShapedArray(grad_x_aval.shape, grad_x_aval.dtype),
@@ -1089,22 +1254,35 @@ class MHCAggregateBwdPrimitive(_MHCPrimitive):
 
     @staticmethod
     def outer_abstract(
-        grad_out_aval, x_aval, h_pre_aval, grad_x_acc_aval, *, precision, fuse_grad_x_acc
+        grad_out_aval,
+        x_aval,
+        h_pre_aval,
+        grad_x_acc_aval,
+        *,
+        precision,
+        fuse_grad_x_acc,
+        write_grad_x,
     ):
-        """Outer abstract."""
+        """Outer abstract. Without write_grad_x, grad_x is a (1,) placeholder."""
         del grad_out_aval, grad_x_acc_aval, precision
         return (
-            jax.core.ShapedArray(x_aval.shape, jnp.float32 if fuse_grad_x_acc else x_aval.dtype),
+            jax.core.ShapedArray(
+                x_aval.shape if write_grad_x else (1,),
+                jnp.float32 if fuse_grad_x_acc else x_aval.dtype,
+            ),
             jax.core.ShapedArray(h_pre_aval.shape, jnp.float32),
         )
 
     @staticmethod
-    def impl(grad_out, x, h_pre, grad_x_acc, precision, fuse_grad_x_acc):
+    def impl(grad_out, x, h_pre, grad_x_acc, precision, fuse_grad_x_acc, write_grad_x):
         """Allocate the gradient buffers and call the inner primitive."""
         assert MHCAggregateBwdPrimitive.inner_primitive is not None
+        assert write_grad_x or not fuse_grad_x_acc
         x_3d = _flatten_tokens(x, 2)
         M, C, n = x_3d.shape
-        if fuse_grad_x_acc:
+        if not write_grad_x:
+            grad_x_buf = _empty_aliased(x.dtype)
+        elif fuse_grad_x_acc:
             grad_x_buf = grad_x_acc.reshape(M, C, n)
         else:
             grad_x_buf = jnp.empty((M, C, n), dtype=x.dtype)
@@ -1116,11 +1294,16 @@ class MHCAggregateBwdPrimitive(_MHCPrimitive):
             grad_x_buf,
             precision=precision,
             fuse_grad_x_acc=fuse_grad_x_acc,
+            write_grad_x=write_grad_x,
         )
-        return grad_x.reshape(x.shape), grad_h_pre.reshape(h_pre.shape)
+        if write_grad_x:
+            grad_x = grad_x.reshape(x.shape)
+        return grad_x, grad_h_pre.reshape(h_pre.shape)
 
     @staticmethod
-    def lowering(ctx, grad_out, h_pre, grad_h_pre, x, grad_x, *, precision, fuse_grad_x_acc):
+    def lowering(
+        ctx, grad_out, h_pre, grad_h_pre, x, grad_x, *, precision, fuse_grad_x_acc, write_grad_x
+    ):
         """MLIR lowering using triton_call_lowering."""
         M, C, n = ctx.avals_in[3].shape
 
@@ -1149,6 +1332,7 @@ class MHCAggregateBwdPrimitive(_MHCPrimitive):
                 "stride_grad_xCn": 1,
                 "precision": precision,
                 "FUSE_GRAD_X_ACC": fuse_grad_x_acc,
+                "WRITE_GRAD_X": write_grad_x,
             },
         )
 
@@ -1492,6 +1676,30 @@ def mhc_projection_fwd(
     )
 
 
+def mhc_projection_bwd_dphi(x, grad_h, phi, norm_weight, use_tf32=True, use_split_k=False):
+    """grad_phi and grad_norm_weight (None without norm_weight) of `mhc_projection_fwd`."""
+    N = phi.shape[0]
+    if norm_weight is not None:
+        grad_phi, grad_norm_weight = MHCProjectionBwdDphiPrimitive.outer_primitive.bind(
+            x,
+            grad_h,
+            phi,
+            norm_weight,
+            precision="tf32" if use_tf32 else "ieee",
+            use_split_m=use_split_k,
+        )
+        return grad_phi.astype(phi.dtype), grad_norm_weight.astype(norm_weight.dtype)
+    token_axes = tuple(range(x.ndim - 1))
+    grad_phi = jax.lax.dot_general(
+        grad_h[..., :N],
+        x.astype(grad_h.dtype),
+        ((token_axes, token_axes), ((), ())),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    ).astype(phi.dtype)
+    return grad_phi, None
+
+
 def mhc_projection_bwd(
     grad_h: jnp.ndarray,
     grad_ms: jnp.ndarray,
@@ -1523,32 +1731,13 @@ def mhc_projection_bwd(
     """
     check_deterministic("mhc_projection_bwd", use_split_k)
     _check_grad_x_acc(grad_x_acc, x)
-    N = phi.shape[0]
     grad_h = grad_h.astype(jnp.float32)
     grad_ms = grad_ms.astype(jnp.float32)
     has_norm_weight = norm_weight is not None
 
-    if has_norm_weight:
-        grad_phi, grad_norm_weight = MHCProjectionBwdDphiPrimitive.outer_primitive.bind(
-            x,
-            grad_h,
-            phi,
-            norm_weight,
-            precision="tf32" if use_tf32 else "ieee",
-            use_split_m=use_split_k,
-        )
-        grad_phi = grad_phi.astype(phi.dtype)
-        grad_norm_weight = grad_norm_weight.astype(norm_weight.dtype)
-    else:
-        token_axes = tuple(range(x.ndim - 1))
-        grad_phi = jax.lax.dot_general(
-            grad_h[..., :N],
-            x.astype(grad_h.dtype),
-            ((token_axes, token_axes), ((), ())),
-            precision=jax.lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32,
-        ).astype(phi.dtype)
-        grad_norm_weight = None
+    grad_phi, grad_norm_weight = mhc_projection_bwd_dphi(
+        x, grad_h, phi, norm_weight, use_tf32, use_split_k
+    )
 
     (grad_x,) = MHCProjectionBwdDxPrimitive.outer_primitive.bind(
         x,
@@ -1562,6 +1751,92 @@ def mhc_projection_bwd(
         fuse_grad_x_acc=grad_x_acc is not None,
     )
     return grad_x, grad_phi, grad_norm_weight
+
+
+def mhc_bwd_fused_dx_dphi(
+    x: jnp.ndarray,
+    phi: jnp.ndarray,
+    norm_weight: Optional[jnp.ndarray],
+    grad_h: jnp.ndarray,
+    grad_ms: jnp.ndarray,
+    grad_agg: Optional[jnp.ndarray] = None,
+    h_pre: Optional[jnp.ndarray] = None,
+    grad_x_add: Optional[jnp.ndarray] = None,
+    use_tf32: bool = True,
+    fuse_dphi: Optional[bool] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray]]:
+    """
+    Fused backward over x of an mHC block: one kernel reads x once and writes the total x
+    gradient. It replaces the dx kernel of `mhc_projection_bwd`, the grad_x write of
+    `mhc_aggregate_bwd` and the XLA adds of the x gradients and, with `fuse_dphi`, the separate
+    dphi kernel's pass over x.
+
+    Parameters
+    ----------
+    x : jnp.ndarray
+        Hyper-connection input of shape (..., C, n).
+    phi, norm_weight, use_tf32 :
+        The arguments of `mhc_projection_fwd` (phi of shape (N, C*n)).
+    grad_h, grad_ms : jnp.ndarray
+        Gradients of the projection outputs H (..., 32) and ms (...,), e.g. from `mhc_scale_bwd`.
+    grad_agg, h_pre : Optional[jnp.ndarray]
+        Gradient of the `mhc_aggregate` output (..., C) and the H_pre (..., n) it used; adds
+        grad_agg[..., c] * H_pre[..., k] (`mhc_aggregate_bwd` with write_grad_x=False gives
+        grad_h_pre).
+    grad_x_add : Optional[jnp.ndarray]
+        Another x gradient term of x's shape (e.g. grad_x of `mhc_expand_combine_bwd`), added.
+    fuse_dphi : Optional[bool]
+        Accumulate grad_H^T @ x in the same pass instead of running the dphi kernel of
+        `mhc_projection_bwd`. Default: NVTE_MHC_BWD_FUSED_DPHI (default "1").
+
+    Returns
+    -------
+    grad_x (x's shape and dtype), grad_phi (phi's dtype), grad_norm_weight (None if
+    norm_weight is None).
+    """
+    assert x.shape[-1] == 4, "Only n=4 is supported in this implementation"
+    assert (grad_agg is None) == (h_pre is None)
+    if fuse_dphi is None:
+        fuse_dphi = os.environ.get("NVTE_MHC_BWD_FUSED_DPHI", "1") == "1"
+    C, n = x.shape[-2:]
+    tokens = x.shape[:-2]
+    has_norm_weight = norm_weight is not None
+    has_agg, has_add = grad_agg is not None, grad_x_add is not None
+    N = phi.shape[0]
+    x_2d = x.reshape(tokens + (C * n,))
+    grad_h = grad_h.astype(jnp.float32)
+    grad_x, grad_psi = MHCBwdFusedDxDphiPrimitive.outer_primitive.bind(
+        x_2d,
+        phi,
+        norm_weight if has_norm_weight else _unused(phi.dtype),
+        grad_h,
+        grad_ms.astype(jnp.float32),
+        grad_agg if has_agg else _unused(x.dtype),
+        h_pre.astype(jnp.float32) if has_agg else _unused(jnp.float32),
+        grad_x_add.astype(x.dtype).reshape(x_2d.shape) if has_add else _unused(x.dtype),
+        precision=_projection_precision(x.dtype, phi.dtype, has_norm_weight, use_tf32),
+        # With tf32, grad_H is split into bf16 hi + lo parts for two bf16 MMAs on the bf16 x tile
+        # (more accurate than the tf32 of the dphi kernel, and faster here).
+        precision_dphi="bf16x2" if use_tf32 else "ieee",
+        has_norm_weight=has_norm_weight,
+        has_agg=has_agg,
+        has_add=has_add,
+        has_dphi=fuse_dphi,
+        num_m_progs=BWD_FUSED_NUM_M_PROGS,
+    )
+    if not fuse_dphi:
+        grad_phi, grad_norm_weight = mhc_projection_bwd_dphi(
+            x_2d, grad_h, phi, norm_weight, use_tf32
+        )
+        return grad_x.reshape(x.shape), grad_phi, grad_norm_weight
+    grad_psi = grad_psi.sum(axis=0)[:N]  # (N, K), deterministic reduction of the partials
+    if has_norm_weight:
+        grad_phi = grad_psi * norm_weight.astype(jnp.float32)[None, :]
+        grad_norm_weight = jnp.sum(grad_psi * phi.astype(jnp.float32), axis=0)
+        grad_norm_weight = grad_norm_weight.astype(norm_weight.dtype)
+    else:
+        grad_phi, grad_norm_weight = grad_psi, None
+    return grad_x.reshape(x.shape), grad_phi.astype(phi.dtype), grad_norm_weight
 
 
 def mhc_scale_fwd(
@@ -1724,15 +1999,19 @@ def mhc_aggregate_bwd(
     h_pre: jnp.ndarray,
     use_tf32: bool = True,
     grad_x_acc: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    write_grad_x: bool = True,
+) -> Tuple[Optional[jnp.ndarray], jnp.ndarray]:
     """
     Backward of `mhc_aggregate_fwd`.
 
     If `grad_x_acc` (fp32, x's shape) is given, grad_x is accumulated into it and the updated
-    buffer is returned. Returns (grad_x, grad_h_pre in h_pre's dtype).
+    buffer is returned. With `write_grad_x=False` only grad_h_pre is computed (grad_x is None);
+    `mhc_bwd_fused_dx_dphi` then adds the grad_out * H_pre term to the x gradient.
+    Returns (grad_x, grad_h_pre in h_pre's dtype).
     """
     assert x.shape[-1] == 4, "Only n=4 is supported in this implementation"
     _check_grad_x_acc(grad_x_acc, x)
+    assert write_grad_x or grad_x_acc is None
     grad_x, grad_h_pre = MHCAggregateBwdPrimitive.outer_primitive.bind(
         grad_out,
         x,
@@ -1740,8 +2019,9 @@ def mhc_aggregate_bwd(
         grad_x_acc if grad_x_acc is not None else _unused(jnp.float32),
         precision="tf32" if use_tf32 else "ieee",
         fuse_grad_x_acc=grad_x_acc is not None,
+        write_grad_x=write_grad_x,
     )
-    return grad_x, grad_h_pre.astype(h_pre.dtype)
+    return (grad_x if write_grad_x else None), grad_h_pre.astype(h_pre.dtype)
 
 
 def mhc_expand_combine_fwd(

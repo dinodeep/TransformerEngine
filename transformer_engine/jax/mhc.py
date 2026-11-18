@@ -17,6 +17,7 @@ dimension, and the projection and RMSNorm weights are in the matching flattened 
 ``mhc`` wraps these two calls around a sub-layer function.
 """
 
+import os
 from functools import partial
 from typing import Any, Callable, Optional, Tuple
 
@@ -27,6 +28,7 @@ from transformer_engine.jax.triton_extensions.mhc import (
     DEFAULT_NORM_EPS,
     mhc_projection_fwd,
     mhc_projection_bwd,
+    mhc_bwd_fused_dx_dphi,
     mhc_scale_fwd,
     mhc_scale_bwd,
     mhc_sinkhorn_fwd,
@@ -315,6 +317,138 @@ def _mhc_expand_combine_bwd_rule(use_tf32, residuals, grad_out):
 _mhc_expand_combine.defvjp(_mhc_expand_combine_fwd_rule, _mhc_expand_combine_bwd_rule)
 
 
+def _use_fused_bwd() -> bool:
+    """Fused mHC backward over x (default on); NVTE_JAX_MHC_FUSED_BWD=0 uses the per-op chain."""
+    return os.environ.get("NVTE_JAX_MHC_FUSED_BWD", "1") != "0"
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
+def _mhc_gma_fused(
+    x,
+    phi,
+    alpha,
+    beta,
+    norm_weight,
+    use_tf32,
+    use_split_k,
+    norm_eps,
+    pre_eps,
+    sinkhorn_iters,
+    recompute_sinkhorn_hist,
+    with_res,
+):
+    """projection -> scale -> Sinkhorn -> aggregate with one fused backward pass over x.
+
+    Returns (layer_input, H_post, H_res) and, if `with_res`, also x itself as `x_res`, whose
+    gradient (e.g. from `mhc_expand_combine`) the backward adds to the x gradient in its fused
+    kernel.
+    """
+    outputs, _ = _mhc_gma_fused_fwd_rule(
+        x,
+        phi,
+        alpha,
+        beta,
+        norm_weight,
+        use_tf32,
+        use_split_k,
+        norm_eps,
+        pre_eps,
+        sinkhorn_iters,
+        recompute_sinkhorn_hist,
+        with_res,
+    )
+    return outputs
+
+
+def _mhc_gma_fused_fwd_rule(
+    x,
+    phi,
+    alpha,
+    beta,
+    norm_weight,
+    use_tf32,
+    use_split_k,
+    norm_eps,
+    pre_eps,
+    sinkhorn_iters,
+    recompute_sinkhorn_hist,
+    with_res,
+):
+    """Forward: the same kernels as the per-op chain."""
+    tokens = x.shape[:-2]
+    C, n = x.shape[-2:]
+    h, ms = mhc_projection_fwd(
+        x.reshape(tokens + (C * n,)), phi, norm_weight, use_tf32, use_split_k
+    )
+    out = mhc_scale_fwd(h, alpha, beta, ms, n, norm_eps)
+    h_pre = out[..., :n]
+    if pre_eps:
+        h_pre = h_pre + pre_eps
+    h_post = out[..., n : 2 * n]
+    h_res_in = out[..., 2 * n : 2 * n + n * n].reshape(tokens + (n, n))
+    h_res, hist = mhc_sinkhorn_fwd(h_res_in, n, recompute_sinkhorn_hist, sinkhorn_iters)
+    layer_input = mhc_aggregate_fwd(x, h_pre)
+    outputs = (layer_input, h_post, h_res) + ((x,) if with_res else ())
+    residuals = (x, phi, alpha, beta, norm_weight, h, ms, out, h_pre, h_res_in, h_res, hist)
+    return outputs, residuals
+
+
+def _mhc_gma_fused_bwd_rule(
+    use_tf32,
+    use_split_k,
+    norm_eps,
+    pre_eps,
+    sinkhorn_iters,
+    recompute_sinkhorn_hist,
+    with_res,
+    residuals,
+    grads,
+):
+    """Backward: grad_H_pre (aggregate, no grad_x), Sinkhorn, scale, then one fused pass over x."""
+    del use_split_k, pre_eps, recompute_sinkhorn_hist  # the fused kernel is deterministic
+    x, phi, alpha, beta, norm_weight, h, ms, out, h_pre, h_res_in, h_res, hist = residuals
+    grad_layer_input, grad_h_post, grad_h_res = grads[:3]
+    grad_x_res = grads[3] if with_res else None
+    tokens = x.shape[:-2]
+    n = x.shape[-1]
+
+    _, grad_h_pre = mhc_aggregate_bwd(grad_layer_input, x, h_pre, use_tf32, write_grad_x=False)
+    grad_h_res_in = mhc_sinkhorn_bwd(
+        grad_h_res.astype(jnp.float32), h_res_in, h_res, hist, n, sinkhorn_iters
+    )
+    grad_out = jnp.concatenate(
+        [
+            grad_h_pre.astype(jnp.float32),
+            grad_h_post.astype(jnp.float32),
+            grad_h_res_in.reshape(tokens + (n * n,)).astype(jnp.float32),
+            jnp.zeros(tokens + (out.shape[-1] - 2 * n - n * n,), jnp.float32),
+        ],
+        axis=-1,
+    )
+    grad_h, grad_alpha, grad_beta, grad_ms = mhc_scale_bwd(grad_out, h, alpha, ms, out, n, norm_eps)
+    grad_x, grad_phi, grad_norm_weight = mhc_bwd_fused_dx_dphi(
+        x,
+        phi,
+        norm_weight,
+        grad_h,
+        grad_ms,
+        grad_agg=grad_layer_input,
+        h_pre=h_pre,
+        grad_x_add=grad_x_res,
+        use_tf32=use_tf32,
+    )
+    return (
+        grad_x,
+        grad_phi,
+        grad_alpha,
+        grad_beta.reshape(beta.shape).astype(beta.dtype),
+        grad_norm_weight,
+    )
+
+
+_mhc_gma_fused.defvjp(_mhc_gma_fused_fwd_rule, _mhc_gma_fused_bwd_rule)
+
+
 def mhc_generate_mix_and_aggregate(
     x: jnp.ndarray,
     phi: jnp.ndarray,
@@ -370,6 +504,21 @@ def mhc_generate_mix_and_aggregate(
     tokens = x.shape[:-2]
     C, n = x.shape[-2:]
     assert n == 4, "Only n=4 is supported in this implementation"
+    if _use_fused_bwd():
+        return _mhc_gma_fused(
+            x,
+            phi,
+            alpha,
+            beta,
+            norm_weight,
+            use_tf32,
+            use_split_k,
+            norm_eps,
+            pre_eps,
+            sinkhorn_iters,
+            recompute_sinkhorn_hist,
+            False,
+        )
     h, ms = mhc_projection(x.reshape(tokens + (C * n,)), phi, norm_weight, use_tf32, use_split_k)
     h_pre, h_post, h_res = mhc_scale(h, alpha, beta, ms, n, norm_eps)
     if pre_eps:
@@ -423,22 +572,42 @@ def mhc(
     -------
     Output of shape (..., C, n) in x's dtype, or `(output, aux)` if `has_aux`.
     """
-    layer_input, h_post, h_res = mhc_generate_mix_and_aggregate(
-        x,
-        phi,
-        alpha,
-        beta,
-        norm_weight,
-        use_tf32=use_tf32,
-        use_split_k=use_split_k,
-        norm_eps=norm_eps,
-        pre_eps=pre_eps,
-        sinkhorn_iters=sinkhorn_iters,
-        recompute_sinkhorn_hist=recompute_sinkhorn_hist,
-    )
+    if _use_fused_bwd():
+        # x_res is x itself, passed through `_mhc_gma_fused` so that its gradient (the x
+        # gradient of expand-combine) is added inside the one fused kernel that writes the whole
+        # x gradient, instead of by XLA after it.
+        layer_input, h_post, h_res, x_res = _mhc_gma_fused(
+            x,
+            phi,
+            alpha,
+            beta,
+            norm_weight,
+            use_tf32,
+            use_split_k,
+            norm_eps,
+            pre_eps,
+            sinkhorn_iters,
+            recompute_sinkhorn_hist,
+            True,
+        )
+    else:
+        layer_input, h_post, h_res = mhc_generate_mix_and_aggregate(
+            x,
+            phi,
+            alpha,
+            beta,
+            norm_weight,
+            use_tf32=use_tf32,
+            use_split_k=use_split_k,
+            norm_eps=norm_eps,
+            pre_eps=pre_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            recompute_sinkhorn_hist=recompute_sinkhorn_hist,
+        )
+        x_res = x
     if has_aux:
         layer_out, aux = branch_fn(layer_input)
     else:
         layer_out, aux = branch_fn(layer_input), None
-    out = mhc_expand_combine(layer_out, None, h_post, x, h_res, use_tf32)
+    out = mhc_expand_combine(layer_out, None, h_post, x_res, h_res, use_tf32)
     return (out, aux) if has_aux else out

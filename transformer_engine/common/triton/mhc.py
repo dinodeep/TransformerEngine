@@ -538,6 +538,261 @@ def _mhc_projection_bwd_fused_dphi(
         tl.store(grad_norm_weight_ptrs, grad_norm_weight.to(norm_weight.dtype), mask=mask_k)
 
 
+def bwd_fused_dx_dphi_configs():
+    # Grid = (cdiv(K, BLOCK_SIZE_K), NUM_M_PROGS): each program owns one K slab, keeps
+    # (phi * norm_weight) for it in registers and loops over the M tiles pid_m, pid_m + NUM_M_PROGS,
+    # ... It writes its partial grad_psi = grad_H^T @ x for the slab to its own workspace row, so
+    # the reduction over the NUM_M_PROGS partials (in the wrapper) is deterministic. NUM_M_PROGS
+    # sizes that workspace, so the wrapper fixes it rather than the autotuner.
+    # Short pinned list, best first (each extra config costs autotune time at the first launch).
+    # GB300, T=28672, K=16384 with the aggregate and x-gradient terms and dphi: (64, 128, 4 warps,
+    # 2 stages) 535-540 us, (64, 128, 8, 2) 548 us; BLOCK_SIZE_K=256 or BLOCK_SIZE_M=128 with
+    # 4 warps spill registers (>= 920 us).
+    cfgs = [(64, 128, 4, 2), (64, 128, 8, 2)]
+    if os.environ.get("NVTE_MHC_BWD_FUSED_CFG"):  # "bm,bk,warps,stages", for sweeps
+        cfgs = [tuple(int(v) for v in os.environ["NVTE_MHC_BWD_FUSED_CFG"].split(","))]
+    configs = [
+        triton.Config({"BLOCK_SIZE_M": bm, "BLOCK_SIZE_K": bk}, num_warps=w, num_stages=st)
+        for bm, bk, w, st in cfgs
+    ]
+    if os.environ.get("NVTE_DISABLE_TRITON_AUTOTUNING", "0") == "1":
+        configs = configs[:1]
+    return configs
+
+
+@triton.jit
+def _split4(t):
+    """(B, 4) -> its 4 columns, each (B,)."""
+    lo, hi = tl.split(
+        tl.reshape(t, (t.shape[0], 2, 2))
+    )  # last index 0 / 1: columns {0, 2} / {1, 3}
+    c0, c2 = tl.split(lo)
+    c1, c3 = tl.split(hi)
+    return c0, c1, c2, c3
+
+
+@triton.jit
+def _load_agg_tile(grad_agg_ptr, h_pre_ptr, offs_m, offs_c, M, C, n: tl.constexpr):
+    mask_m = offs_m < M
+    grad_agg = tl.load(
+        grad_agg_ptr + offs_m[:, None] * C + offs_c[None, :],
+        mask=mask_m[:, None] & (offs_c < C)[None, :],
+        other=0.0,
+    )  # (BLOCK_SIZE_M, BLOCK_SIZE_C)
+    h_pre = tl.load(
+        h_pre_ptr + offs_m[:, None] * n + tl.arange(0, n)[None, :], mask=mask_m[:, None], other=0.0
+    )  # (BLOCK_SIZE_M, n)
+    return grad_agg, h_pre
+
+
+@triton.autotune(
+    configs=bwd_fused_dx_dphi_configs(),
+    key=["M", "K", "HAS_AGG", "HAS_ADD", "HAS_DPHI", "USE_TMA"],
+)
+@triton.jit
+def _mhc_bwd_fused_dx_dphi(
+    x_ptr,  # (M, K), K = C * n in the flattened (C, n) order
+    phi_ptr,  # (N, K)
+    norm_weight_ptr,  # (K,), not read if HAS_NORM_WEIGHT is False
+    grad_h_ptr,  # (M, 32) fp32, gradient of the projection output H
+    grad_ms_ptr,  # (M,) fp32, gradient of the mean square
+    grad_agg_ptr,  # (M, C), gradient of the aggregate output (layer_input); read if HAS_AGG
+    h_pre_ptr,  # (M, n) fp32, H_pre as used by the aggregate; read if HAS_AGG
+    grad_x_add_ptr,  # (M, K), another x-gradient term (e.g. of expand-combine); read if HAS_ADD
+    grad_x_ptr,  # (M, K) output, total gradient of x
+    grad_psi_ptr,  # (NUM_M_PROGS, 32, K) fp32 output, partial grad_H^T @ x; written if HAS_DPHI
+    M,
+    N,
+    K,
+    n: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    NUM_M_PROGS: tl.constexpr,
+    precision: tl.constexpr,  # of grad_H @ (phi * norm_weight)
+    # of grad_H^T @ x: "bf16x2" computes x^T @ grad_H as two bf16 MMAs with grad_H split into bf16
+    # hi + lo parts (~16 mantissa bits of grad_H, more accurate than tf32; x^T is the A operand so
+    # the MMA reads the bf16 x tile directly); otherwise a tl.dot input precision on fp32 x.
+    precision_dphi: tl.constexpr,
+    HAS_NORM_WEIGHT: tl.constexpr,
+    HAS_AGG: tl.constexpr,
+    HAS_ADD: tl.constexpr,
+    HAS_DPHI: tl.constexpr,
+    USE_TMA: tl.constexpr,
+):
+    """
+    One pass over x for the whole x gradient of an mHC block and the phi gradient:
+
+        grad_x = 2 * x * grad_ms / K + grad_H @ (phi * norm_weight)   (projection + RMS term)
+               + grad_agg[:, c] * H_pre[:, k]                           (aggregate, HAS_AGG)
+               + grad_x_add                                             (HAS_ADD)
+        grad_psi[pid_m] = sum over this program's M tiles of grad_H^T @ x   (HAS_DPHI)
+
+    at the flattened index c * n + k of x. grad_phi = sum(grad_psi) * norm_weight and
+    grad_norm_weight = sum(sum(grad_psi) * phi, 0) are finished in the wrapper.
+    """
+    pid_k = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+
+    tl.static_assert(n == 4)
+    tl.static_assert(BLOCK_SIZE_N == 32)
+    tl.static_assert(BLOCK_SIZE_K % (n * 32) == 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_k >= 0)
+    tl.assume(M > 0)
+    tl.assume(K > 0)
+    BLOCK_SIZE_C: tl.constexpr = BLOCK_SIZE_K // n
+    C = K // n
+
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    offs_c = pid_k * BLOCK_SIZE_C + tl.arange(0, BLOCK_SIZE_C)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    mask_k = offs_k < K
+
+    # (phi * norm_weight) for this K slab, loaded and scaled once per program.
+    phi = tl.load(
+        phi_ptr + offs_n[:, None] * K + offs_k[None, :],
+        mask=(offs_n[:, None] < N) & mask_k[None, :],
+        other=0.0,
+    )  # (BLOCK_SIZE_N, BLOCK_SIZE_K)
+    if HAS_NORM_WEIGHT:
+        norm_weight = tl.load(norm_weight_ptr + offs_k, mask=mask_k, other=0.0)
+        phi = phi.to(tl.float32) * norm_weight.to(tl.float32)[None, :]
+
+    if USE_TMA:
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr, shape=[M, K], strides=[K, 1], block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K]
+        )
+        grad_x_desc = tl.make_tensor_descriptor(
+            grad_x_ptr, shape=[M, K], strides=[K, 1], block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K]
+        )
+        grad_h_desc = tl.make_tensor_descriptor(
+            grad_h_ptr,
+            shape=[M, BLOCK_SIZE_N],
+            strides=[BLOCK_SIZE_N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+        if HAS_ADD:
+            grad_x_add_desc = tl.make_tensor_descriptor(
+                grad_x_add_ptr,
+                shape=[M, K],
+                strides=[K, 1],
+                block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+            )
+
+    if HAS_DPHI:
+        if precision_dphi == "bf16x2":
+            grad_psi_acc = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)  # transposed
+        else:
+            grad_psi_acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32)
+
+    # The aggregate-term operands are register-prefetched one M tile ahead: the software
+    # pipeliner only pipelines the loads that feed the MMAs, and these loads otherwise stall.
+    if HAS_AGG:
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        grad_agg_next, h_pre_next = _load_agg_tile(grad_agg_ptr, h_pre_ptr, offs_m, offs_c, M, C, n)
+
+    inv_k2 = 2 / tl.cast(K, tl.float32)
+    for m_tile in tl.range(pid_m, tl.cdiv(M, BLOCK_SIZE_M), NUM_M_PROGS):
+        m0 = m_tile * BLOCK_SIZE_M
+        offs_m = m0 + tl.arange(0, BLOCK_SIZE_M)
+        mask_m = offs_m < M
+        if HAS_AGG:
+            grad_agg = grad_agg_next
+            h_pre = h_pre_next
+            grad_agg_next, h_pre_next = _load_agg_tile(
+                grad_agg_ptr, h_pre_ptr, offs_m + NUM_M_PROGS * BLOCK_SIZE_M, offs_c, M, C, n
+            )
+        if USE_TMA:
+            x = tl.load_tensor_descriptor(x_desc, [m0, pid_k * BLOCK_SIZE_K])
+            grad_h = tl.load_tensor_descriptor(grad_h_desc, [m0, 0])
+        else:
+            x = tl.load(
+                x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            )  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+            grad_h = tl.load(
+                grad_h_ptr + offs_m[:, None] * BLOCK_SIZE_N + offs_n[None, :],
+                mask=mask_m[:, None],
+                other=0.0,
+            )  # (BLOCK_SIZE_M, BLOCK_SIZE_N); columns >= N are zero
+        grad_ms = tl.load(grad_ms_ptr + offs_m, mask=mask_m, other=0.0)  # (BLOCK_SIZE_M,)
+
+        if HAS_DPHI:
+            if precision_dphi == "bf16x2":
+                # grad_psi^T += x^T @ grad_H, x^T (BLOCK_SIZE_K rows) being the MMA's A operand.
+                grad_h_hi = grad_h.to(tl.bfloat16)
+                grad_h_lo = (grad_h - grad_h_hi.to(tl.float32)).to(tl.bfloat16)
+                grad_psi_acc = tl.dot(
+                    tl.trans(x, (1, 0)), grad_h_hi, acc=grad_psi_acc, out_dtype=tl.float32
+                )
+                grad_psi_acc = tl.dot(
+                    tl.trans(x, (1, 0)), grad_h_lo, acc=grad_psi_acc, out_dtype=tl.float32
+                )
+            else:
+                grad_psi_acc = tl.dot(
+                    tl.trans(grad_h, (1, 0)),
+                    x.to(grad_h.dtype),
+                    acc=grad_psi_acc,
+                    input_precision=precision_dphi,
+                    out_dtype=tl.float32,
+                )  # (BLOCK_SIZE_N, BLOCK_SIZE_K)
+
+        grad_x = x * (grad_ms * inv_k2)[:, None]
+        if HAS_ADD:
+            if USE_TMA:
+                grad_x_add = tl.load_tensor_descriptor(grad_x_add_desc, [m0, pid_k * BLOCK_SIZE_K])
+            else:
+                grad_x_add = tl.load(
+                    grad_x_add_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=mask_m[:, None] & mask_k[None, :],
+                    other=0.0,
+                )
+            grad_x = grad_x + grad_x_add.to(tl.float32)
+        grad_x = tl.dot(
+            grad_h.to(phi.dtype), phi, acc=grad_x, input_precision=precision, out_dtype=tl.float32
+        )  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+
+        if HAS_AGG:
+            # grad_agg[:, c] * H_pre[:, k] as (BLOCK_SIZE_M, BLOCK_SIZE_C) planes of the stream
+            # index k (n = 4 is too small for tl.dot), then interleaved back to c * n + k.
+            grad_agg = grad_agg.to(tl.float32)
+            h_pre0, h_pre1, h_pre2, h_pre3 = _split4(h_pre)
+            e0 = grad_agg * h_pre0[:, None]
+            e1 = grad_agg * h_pre1[:, None]
+            e2 = grad_agg * h_pre2[:, None]
+            e3 = grad_agg * h_pre3[:, None]
+            # (BLOCK_SIZE_M, BLOCK_SIZE_C, a, b) with k = 2 * a + b
+            e = tl.join(tl.join(e0, e2), tl.join(e1, e3))
+            grad_x = grad_x + tl.reshape(e, (BLOCK_SIZE_M, BLOCK_SIZE_K))
+
+        if USE_TMA:
+            tl.store_tensor_descriptor(grad_x_desc, [m0, pid_k * BLOCK_SIZE_K], grad_x.to(x.dtype))
+        else:
+            tl.store(
+                grad_x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                grad_x.to(x.dtype),
+                mask=mask_m[:, None] & mask_k[None, :],
+            )
+
+    if HAS_DPHI:
+        grad_psi_ptr += pid_m * (BLOCK_SIZE_N * K)
+        if precision_dphi == "bf16x2":
+            tl.store(
+                grad_psi_ptr + offs_n[None, :] * K + offs_k[:, None],
+                grad_psi_acc,
+                mask=mask_k[:, None],
+            )
+        else:
+            tl.store(
+                grad_psi_ptr + offs_n[:, None] * K + offs_k[None, :],
+                grad_psi_acc,
+                mask=mask_k[None, :],
+            )
+
+
 def scale_config():
     block_m = [128]
     warps = [4]
@@ -1394,6 +1649,9 @@ def _mhc_aggregate_bwd(
     STEP_SIZE_C: tl.constexpr,
     precision: tl.constexpr,
     FUSE_GRAD_X_ACC: tl.constexpr,
+    # If False, only grad_H_pre is computed and grad_x_ptr is never written: the x gradient
+    # (grad_out * H_pre) is then added by the fused `_mhc_bwd_fused_dx_dphi` kernel instead.
+    WRITE_GRAD_X: tl.constexpr = True,
 ):
     """
     Forward:
@@ -1460,22 +1718,27 @@ def _mhc_aggregate_bwd(
             out_dtype=tl.float32,
         )
 
-        # grad_x = grad_output @ H_pre.T: (BLOCK_SIZE_M, STEP_SIZE_C, 1) @ (BLOCK_SIZE_M, 1, n) = (BLOCK_SIZE_M, STEP_SIZE_C, n)
-        grad_x = grad_output[:, :, None] * H_pre[:, None, :]  # (BLOCK_SIZE_M, STEP_SIZE_C, n)
-        grad_x = tl.reshape(grad_x, (BLOCK_SIZE_M, STEP_SIZE_C * n))
+        if WRITE_GRAD_X:
+            # grad_x = grad_output @ H_pre.T: (BLOCK_SIZE_M, STEP_SIZE_C, 1) @ (BLOCK_SIZE_M, 1, n) = (BLOCK_SIZE_M, STEP_SIZE_C, n)
+            grad_x = grad_output[:, :, None] * H_pre[:, None, :]  # (BLOCK_SIZE_M, STEP_SIZE_C, n)
+            grad_x = tl.reshape(grad_x, (BLOCK_SIZE_M, STEP_SIZE_C * n))
 
-        grad_x_ptrs = (
-            grad_x_ptr + offs_m[:, None] * stride_grad_xm + offs_cn[None, :] * stride_grad_xCn
-        )
+            grad_x_ptrs = (
+                grad_x_ptr + offs_m[:, None] * stride_grad_xm + offs_cn[None, :] * stride_grad_xCn
+            )
 
-        if FUSE_GRAD_X_ACC:  # If fused gradient accumulation is enabled, the buffer is always fp32
-            grad_x_acc = tl.load(grad_x_ptrs, mask=mask_m[:, None] & mask_cn[None, :], other=0.0)
-            grad_x = grad_x.to(tl.float32) + grad_x_acc
-        tl.store(
-            grad_x_ptrs,
-            grad_x,
-            mask=mask_m[:, None] & mask_cn[None, :],
-        )
+            if (
+                FUSE_GRAD_X_ACC
+            ):  # If fused gradient accumulation is enabled, the buffer is always fp32
+                grad_x_acc = tl.load(
+                    grad_x_ptrs, mask=mask_m[:, None] & mask_cn[None, :], other=0.0
+                )
+                grad_x = grad_x.to(tl.float32) + grad_x_acc
+            tl.store(
+                grad_x_ptrs,
+                grad_x,
+                mask=mask_m[:, None] & mask_cn[None, :],
+            )
 
     grad_H_pre = tl.reshape(grad_H_pre_acc, (BLOCK_SIZE_M * n,))  # (BLOCK_SIZE_M * n)
     offs_grad_H_pre = pid_m * BLOCK_SIZE_M * n + tl.arange(0, BLOCK_SIZE_M * n)
