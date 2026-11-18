@@ -428,7 +428,8 @@ class MHCProjectionBwdDxPrimitive(_MHCPrimitive):
         N = ctx.avals_in[2].shape[0]
 
         def grid(meta):
-            return (triton.cdiv(M, meta["BLOCK_SIZE_M"]), triton.cdiv(K, meta["BLOCK_SIZE_K"]))
+            # One program per (K slab, M-tile stride class); each loops over its M tiles.
+            return (triton.cdiv(K, meta["BLOCK_SIZE_K"]), meta["NUM_M_PROGS"])
 
         return triton_call_lowering(
             ctx,
@@ -461,6 +462,10 @@ class MHCProjectionBwdDxPrimitive(_MHCPrimitive):
                 "precision": precision,
                 "FUSE_GRAD_X_ACC": fuse_grad_x_acc,
                 "HAS_NORM_WEIGHT": has_norm_weight,
+                # TMA load of x and TMA store of grad_x (same gate as the forward). The fp32
+                # read-modify-write accumulation path keeps pointer loads/stores.
+                "USE_TMA": (not fuse_grad_x_acc)
+                and _projection_fwd_use_tma(ctx.avals_in[0], ctx.avals_in[2]),
             },
         )
 
@@ -580,6 +585,10 @@ class MHCProjectionBwdDphiPrimitive(_MHCPrimitive):
                 "BLOCK_SIZE_N": H_PADDED_DIM,
                 "precision": precision,
                 "USE_SPLIT_M": use_split_m,
+                # TMA loads of x and grad_H. Only without split-M: TMA does not stop at the end
+                # of an M block, only at the end of the array.
+                "USE_TMA": (not use_split_m)
+                and _projection_fwd_use_tma(ctx.avals_in[0], ctx.avals_in[2]),
             },
         )
 

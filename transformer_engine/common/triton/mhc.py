@@ -47,13 +47,16 @@ def projection_prune_fwd(configs, named_args, **kwargs):
         # Deterministic path: a single K block covers the whole reduction, so each program
         # stores its result instead of atomic-adding across split-K blocks.
         K = named_args.get("K", kwargs.get("K", None))
-        block_m_and_warps = [(16, 2), (16, 8), (64, 8)]
         block_k = align_to(K, 32)
-        step_k = [256]
-        stages = [2, 3, 4]
+        # Short pinned list (each extra config costs autotune time at first launch). BLOCK_SIZE_M=64
+        # with 4 warps and a smaller STEP_SIZE_K (~57 KB smem) streams x faster than the former
+        # (BM, 2/8 warps, STEP_SIZE_K=256) space: 248 -> 162 us at T=24576, C=4096, n=4 on GB300.
+        # The former best (64, 256, 8 warps) is kept as a fallback. Best first, so that
+        # NVTE_DISABLE_TRITON_AUTOTUNING=1 picks it.
+        bm_sk_w_s = [(64, 128, 4, 3), (64, 64, 4, 4), (64, 128, 4, 2), (64, 256, 8, 2)]
 
         pruned_configs = []
-        for (bm, w), sk, s in itertools.product(block_m_and_warps, step_k, stages):
+        for bm, sk, w, s in bm_sk_w_s:
             pruned_configs.append(
                 triton.Config(
                     {
@@ -196,16 +199,19 @@ def _mhc_projection_fwd_fused(
 
 
 def projection_config_bwd_dx():
-    block_m = [32, 128]
-    block_k = [128]
-    warps = [2]
-    stages = [2, 3, 4]
-
-    configs = []
-    for m, bk, w, s in itertools.product(block_m, block_k, warps, stages):
-        configs.append(
-            triton.Config({"BLOCK_SIZE_M": m, "BLOCK_SIZE_K": bk}, num_warps=w, num_stages=s)
+    # Each program owns one BLOCK_SIZE_K slab of K, keeps (phi * norm_weight) for it in registers
+    # and loops over the M tiles pid_m, pid_m + NUM_M_PROGS, ... (grid = (cdiv(K, BLOCK_SIZE_K),
+    # NUM_M_PROGS)). The former one-tile-per-program layout launched ~100k CTAs that each re-read
+    # their phi tile. Short pinned list, best first (GB300, T=24576, K=16384: 442 -> 270 us with TMA).
+    bm_bk_nmp_w_s = [(64, 256, 4, 4, 2), (64, 128, 8, 4, 3), (32, 128, 8, 4, 2)]
+    configs = [
+        triton.Config(
+            {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_K": bk, "NUM_M_PROGS": nmp},
+            num_warps=w,
+            num_stages=st,
         )
+        for bm, bk, nmp, w, st in bm_bk_nmp_w_s
+    ]
     if os.environ.get("NVTE_DISABLE_TRITON_AUTOTUNING", "0") == "1":
         configs = configs[:1]
     return configs
@@ -213,7 +219,7 @@ def projection_config_bwd_dx():
 
 @triton.autotune(
     configs=projection_config_bwd_dx(),
-    key=["M", "K"],
+    key=["M", "K", "USE_TMA"],
     # When FUSE_GRAD_X_ACC=True the kernel does a read-modify-write on grad_x_ptr; without
     # restore_value the autotune timing trials accumulate onto the buffer and corrupt it.
     restore_value=["grad_x_ptr"],
@@ -245,17 +251,20 @@ def _mhc_projection_bwd_fused_dx(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    NUM_M_PROGS: tl.constexpr,
     precision: tl.constexpr,
     FUSE_GRAD_X_ACC: tl.constexpr,
     HAS_NORM_WEIGHT: tl.constexpr,
+    USE_TMA: tl.constexpr,  # TMA load of x and TMA store of grad_x. Must be False with FUSE_GRAD_X_ACC.
 ):
-    pid_m = tl.program_id(axis=0)
-    pid_k = tl.program_id(axis=1)
+    pid_k = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
 
     tl.assume(pid_m >= 0)
     tl.assume(pid_k >= 0)
     tl.assume(stride_xm > 0)
     tl.assume(stride_xk == 1)
+    tl.assume(stride_grad_xm > 0)
     tl.assume(stride_grad_hm == 32)
     tl.assume(stride_grad_hn == 1)
     tl.assume(stride_phin == K)
@@ -269,54 +278,75 @@ def _mhc_projection_bwd_fused_dx(
     tl.assume(BLOCK_SIZE_K % 32 == 0)
     tl.assume(BLOCK_SIZE_N == 32)
 
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
     offs_n_full = tl.arange(0, BLOCK_SIZE_N)
-    mask_m = offs_m < M
     mask_k = offs_k < K
 
-    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-    x = tl.load(
-        x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0
-    )  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-
-    grad_h_ptrs = (
-        grad_h_ptr + offs_m[:, None] * stride_grad_hm + offs_n_full[None, :] * stride_grad_hn
-    )
-    grad_h = tl.load(
-        grad_h_ptrs, mask=mask_m[:, None] & (offs_n_full[None, :] < N), other=0.0
-    )  # (BLOCK_SIZE_M, BLOCK_SIZE_N)
-
-    phi_ptrs = phi_ptr + offs_n_full[:, None] * stride_phin + offs_k[None, :] * stride_phik
-    offs_ms = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    grad_ms_ptrs = grad_ms_ptr + offs_ms * stride_grad_ms
-
+    # (phi * norm_weight) for this K slab, loaded and scaled once per program.
     phi = tl.load(
-        phi_ptrs, mask=(offs_n_full[:, None] < N) & mask_k[None, :], other=0.0
+        phi_ptr + offs_n_full[:, None] * stride_phin + offs_k[None, :] * stride_phik,
+        mask=(offs_n_full[:, None] < N) & mask_k[None, :],
+        other=0.0,
     )  # (BLOCK_SIZE_N, BLOCK_SIZE_K)
-
     if HAS_NORM_WEIGHT:
-        norm_weight_ptrs = norm_weight_ptr + offs_k * stride_norm_weight
-        norm_weight = tl.load(norm_weight_ptrs, mask=mask_k, other=0.0, cache_modifier=".ca").to(
-            phi.dtype
+        norm_weight = tl.load(
+            norm_weight_ptr + offs_k * stride_norm_weight, mask=mask_k, other=0.0
         )  # (BLOCK_SIZE_K,)
         phi = phi.to(tl.float32) * norm_weight.to(tl.float32)[None, :]
 
-    grad_ms = tl.load(
-        grad_ms_ptrs, mask=offs_ms < M, other=0.0, cache_modifier=".ca"
-    )  # (BLOCK_SIZE_M,)
+    if USE_TMA:
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr, shape=[M, K], strides=[stride_xm, 1], block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K]
+        )
+        grad_x_desc = tl.make_tensor_descriptor(
+            grad_x_ptr,
+            shape=[M, K],
+            strides=[stride_grad_xm, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
 
-    grad_x = x * (grad_ms * 2 / tl.cast(K, tl.float32))[:, None]
-    grad_x = tl.dot(
-        grad_h.to(phi.dtype), phi, acc=grad_x, input_precision=precision, out_dtype=tl.float32
-    )  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-    grad_x_ptrs = grad_x_ptr + offs_m[:, None] * stride_grad_xm + offs_k[None, :] * stride_grad_xk
-    if FUSE_GRAD_X_ACC:  # If fused gradient accumulation is enabled, the buffer is always fp32
-        grad_x_acc = tl.load(grad_x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-        grad_x = grad_x.to(tl.float32) + grad_x_acc
-    else:
-        grad_x = grad_x.to(x.dtype)
-    tl.store(grad_x_ptrs, grad_x, mask=mask_m[:, None] & mask_k[None, :])
+    inv_k2 = 2 / tl.cast(K, tl.float32)
+    for m_tile in tl.range(pid_m, tl.cdiv(M, BLOCK_SIZE_M), NUM_M_PROGS):
+        offs_m = m_tile * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        mask_m = offs_m < M
+        if USE_TMA:
+            x = tl.load_tensor_descriptor(x_desc, [m_tile * BLOCK_SIZE_M, pid_k * BLOCK_SIZE_K])
+        else:
+            x = tl.load(
+                x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            )  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        grad_h = tl.load(
+            grad_h_ptr + offs_m[:, None] * stride_grad_hm + offs_n_full[None, :] * stride_grad_hn,
+            mask=mask_m[:, None] & (offs_n_full[None, :] < N),
+            other=0.0,
+        )  # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        grad_ms = tl.load(
+            grad_ms_ptr + offs_m * stride_grad_ms, mask=mask_m, other=0.0
+        )  # (BLOCK_SIZE_M,)
+
+        grad_x = x * (grad_ms * inv_k2)[:, None]
+        grad_x = tl.dot(
+            grad_h.to(phi.dtype), phi, acc=grad_x, input_precision=precision, out_dtype=tl.float32
+        )  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        if FUSE_GRAD_X_ACC:  # If fused gradient accumulation is enabled, the buffer is always fp32
+            grad_x_ptrs = (
+                grad_x_ptr + offs_m[:, None] * stride_grad_xm + offs_k[None, :] * stride_grad_xk
+            )
+            grad_x_acc = tl.load(grad_x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+            grad_x = grad_x.to(tl.float32) + grad_x_acc
+            tl.store(grad_x_ptrs, grad_x, mask=mask_m[:, None] & mask_k[None, :])
+        elif USE_TMA:
+            tl.store_tensor_descriptor(
+                grad_x_desc, [m_tile * BLOCK_SIZE_M, pid_k * BLOCK_SIZE_K], grad_x.to(x.dtype)
+            )
+        else:
+            tl.store(
+                grad_x_ptr + offs_m[:, None] * stride_grad_xm + offs_k[None, :] * stride_grad_xk,
+                grad_x.to(x.dtype),
+                mask=mask_m[:, None] & mask_k[None, :],
+            )
 
 
 def projection_config_bwd_dphi():
@@ -369,16 +399,16 @@ def projection_prune_bwd_dphi(configs, named_args, **kwargs):
     else:
         # Deterministic path: a single M block covers the whole reduction, so each program
         # stores grad_phi/grad_norm_weight instead of atomic-adding across split-M blocks.
-        block_k = [128]
+        # BLOCK_SIZE_K=64 gives K/64 programs (256 for K=16384) instead of K/128 = 128 on a
+        # 152-SM GB300, and STEP_SIZE_M=128 keeps more bytes in flight per program. Short
+        # pinned list, best first (GB300, M=28672, K=16384 with TMA: 395 -> 192 us; results
+        # bit-identical to the former BLOCK_SIZE_K=128 / STEP_SIZE_M=32 configs). The last
+        # entry (2 stages) fits in the shared memory of any supported GPU.
+        bk_sm_w_s = [(64, 128, 4, 4), (64, 128, 4, 3), (64, 64, 4, 4), (64, 32, 4, 2)]
         block_m = align_to(M, 128)
-        step_m = [32]
-        warps = [4]
-        # Descending so that when autotuning is disabled (first config taken below), we pick
-        # the deepest pipeline that fits in shared memory. stages=2 fits on any supported GPU.
-        stages = [8, 6, 4, 2]
 
         pruned_configs = []
-        for bk, sm, w, s in itertools.product(block_k, step_m, warps, stages):
+        for bk, sm, w, s in bk_sm_w_s:
             pruned_configs.append(
                 triton.Config(
                     {"BLOCK_SIZE_M": block_m, "STEP_SIZE_M": sm, "BLOCK_SIZE_K": bk},
@@ -450,6 +480,7 @@ def _mhc_projection_bwd_fused_dphi(
     BLOCK_SIZE_N: tl.constexpr,
     precision: tl.constexpr,
     USE_SPLIT_M: tl.constexpr,  # If True, reduce over split-M blocks via atomic_add (non-deterministic); else a single M block stores its result.
+    USE_TMA: tl.constexpr,  # If True, load x and grad_H tiles via TMA tensor descriptors.
 ):
     pid_k = tl.program_id(axis=0)
     pid_m = tl.program_id(axis=1)
@@ -479,21 +510,41 @@ def _mhc_projection_bwd_fused_dphi(
 
     grad_psi_acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32)
 
+    if USE_TMA:
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr, shape=[M, K], strides=[stride_xm, 1], block_shape=[STEP_SIZE_M, BLOCK_SIZE_K]
+        )
+        grad_H_desc = tl.make_tensor_descriptor(
+            grad_H_ptr,
+            shape=[M, BLOCK_SIZE_N],
+            strides=[stride_grad_Hm, 1],
+            block_shape=[STEP_SIZE_M, BLOCK_SIZE_N],
+        )
+
     m_start = pid_m * BLOCK_SIZE_M
     m_end = tl.minimum(m_start + BLOCK_SIZE_M, M)
-    for m_idx in range(0, tl.cdiv(m_end - m_start, STEP_SIZE_M)):
-        offs_m = m_start + m_idx * STEP_SIZE_M + tl.arange(0, STEP_SIZE_M)
-        mask_m = offs_m < M
-        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-        x = tl.load(
-            x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0
-        )  # (STEP_SIZE_M, BLOCK_SIZE_K)
-        grad_H_ptrs = (
-            grad_H_ptr + offs_m[:, None] * stride_grad_Hm + offs_n_full[None, :] * stride_grad_Hn
-        )
-        grad_H = tl.load(
-            grad_H_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0
-        )  # (STEP_SIZE_M, BLOCK_SIZE_N)
+    for m_idx in tl.range(0, tl.cdiv(m_end - m_start, STEP_SIZE_M)):
+        m0 = m_start + m_idx * STEP_SIZE_M
+        if USE_TMA:
+            # Rows past M are zero-filled by TMA. With split-M, rows of the next M block would
+            # be read, so the lowering only enables TMA when a single M block covers all rows.
+            x = tl.load_tensor_descriptor(x_desc, [m0, pid_k * BLOCK_SIZE_K])
+            grad_H = tl.load_tensor_descriptor(grad_H_desc, [m0, 0])
+        else:
+            offs_m = m0 + tl.arange(0, STEP_SIZE_M)
+            mask_m = offs_m < m_end
+            x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+            x = tl.load(
+                x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0
+            )  # (STEP_SIZE_M, BLOCK_SIZE_K)
+            grad_H_ptrs = (
+                grad_H_ptr
+                + offs_m[:, None] * stride_grad_Hm
+                + offs_n_full[None, :] * stride_grad_Hn
+            )
+            grad_H = tl.load(
+                grad_H_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0
+            )  # (STEP_SIZE_M, BLOCK_SIZE_N)
 
         grad_psi_acc = tl.dot(
             tl.trans(grad_H, (1, 0)),
@@ -1328,9 +1379,10 @@ def aggregate_prune_bwd(_, named_args, **kwargs):
     C = named_args.get("C", kwargs.get("C", None))
     block_m = [4]
     block_c = align_to(C, 64)
+    # 4 warps move more bytes in flight per SM than 1 (GB300: 281 -> 267 us at T=24576, C=4096).
     step_c = [64]
-    warps = [1]
-    stages = [2, 3, 4]
+    warps = [4, 1]
+    stages = [2, 3]
 
     pruned_configs = []
     for bm, sc, w, s in itertools.product(block_m, step_c, warps, stages):
@@ -1650,9 +1702,10 @@ def expand_combine_prune_bwd(_, named_args, **kwargs):
     C = named_args.get("C", kwargs.get("C", None))
     block_m = [4]
     block_c = align_to(C, 32)
-    step_c = [64, 128]
-    warps = [1, 2]
-    stages = [2, 3]
+    # Short list, best first (GB300, T=24576, C=4096: 4 warps, STEP_SIZE_C=128 gives 445 -> 419 us).
+    step_c = [128, 64]
+    warps = [4, 2]
+    stages = [2]
 
     pruned_configs = []
     for bm, sc, w, s in itertools.product(block_m, step_c, warps, stages):
