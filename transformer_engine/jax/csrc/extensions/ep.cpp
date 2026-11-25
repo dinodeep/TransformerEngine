@@ -856,7 +856,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(EpDispatchGemmFwdHandler, EpDispatchGemmFwdFFI,
                                   .Ret<Buffer_Type>()  // expert_token_offsets [E + 4] i32
                                   .Ret<Buffer_Type>()  // handle_mem
                                   .Ret<Buffer_Type>()  // workspace
-                                  .Attrs<EpConfig>());
+                                  .Attrs<EpConfig>(),
+                              FFI_CudaGraph_Traits);
 
 // FC2 overlapped with the combine. BF16: routing weights already in act_out (null here).
 Error_Type EpCombineGemmFwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
@@ -892,7 +893,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(EpCombineGemmFwdHandler, EpCombineGemmFwdFFI,
                                   .Ret<Buffer_Type>()  // expert_out [R, H]
                                   .Ret<Buffer_Type>()  // result [T, H]
                                   .Ret<Buffer_Type>()  // workspace
-                                  .Attrs<EpConfig>());
+                                  .Attrs<EpConfig>(),
+                              FFI_CudaGraph_Traits);
 
 // Combine backward overlapped with FC2 dgrad + SwiGLU backward (+ FC2 wgrad).
 Error_Type EpCombineGemmBwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
@@ -949,7 +951,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(EpCombineGemmBwdHandler, EpCombineGemmBwdFFI,
                                   .Ret<Buffer_Type>()  // grad_recv_topk_weights [R] f32
                                   .Ret<Buffer_Type>()  // weight_grad [E, H, F]
                                   .Ret<Buffer_Type>()  // workspace
-                                  .Attrs<EpConfig>());
+                                  .Attrs<EpConfig>(),
+                              FFI_CudaGraph_Traits);
 
 // FC1 dgrad (+ FC1 wgrad) overlapped with the dispatch backward (a combine of gradients).
 Error_Type EpDispatchGemmBwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
@@ -1002,7 +1005,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(EpDispatchGemmBwdHandler, EpDispatchGemmBwdFFI,
                                   .Ret<Buffer_Type>()  // grad_topk_weights [T, K] f32
                                   .Ret<Buffer_Type>()  // weight_grad [E, 2F, H]
                                   .Ret<Buffer_Type>()  // workspace
-                                  .Attrs<EpConfig>());
+                                  .Attrs<EpConfig>(),
+                              FFI_CudaGraph_Traits);
 
 // -- Borrowed-comm path -------------------------------------------------------
 //
