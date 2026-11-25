@@ -84,6 +84,8 @@ HIDDEN = 512  # multiple of 256
 INTER = 256  # multiple of 64
 NUM_EXPERTS = 8
 TOPK = 2
+# Communication SMs per NCCL EP call; the overlap path needs an explicit ep_bootstrap budget.
+OVERLAP_COMM_SMS = 24
 SEQ = 128
 BATCH_PER_RANK = 2
 
@@ -149,6 +151,7 @@ def layout(request):
             hidden_dim=HIDDEN,
             max_token_dtype=DTYPE,
             num_topk=int(os.environ.get("OVERLAP_TEST_NUM_TOPK", TOPK)),
+            max_num_sms=OVERLAP_COMM_SMS,
         )
     record_ep_bootstrap_signature_for_moe(
         num_experts=NUM_EXPERTS,

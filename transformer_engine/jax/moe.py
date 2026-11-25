@@ -2289,7 +2289,6 @@ def _ep_overlap_rejection_reasons(
         if ep_overlap_comm_sms() <= 0:
             reasons.append(
                 "ep_bootstrap ran without communication SMs for the overlap; pass max_num_sms > 0"
-                " or set NVTE_ENABLE_CUTEDSL_BACKEND=1 and NVTE_MOE_OVERLAP before ep_bootstrap"
             )
     except RuntimeError as exc:
         reasons.append(str(exc))
@@ -2508,12 +2507,8 @@ def _ep_overlap_fwd(
         check_rep=False,
     )(x, topk_idx_3d, topk_w_3d, w1, w2)
     total = total.reshape(-1, 1)
-    # Residual weights for the backward: by default the per-EP-rank weights as the GEMMs read them
-    # (already gathered over the data axes), so an FSDP backward does not gather them again; with
-    # NVTE_JAX_EP_OVERLAP_REGATHER=1 the stored (FSDP-sharded) parameters, gathered again in the
-    # backward (less memory, one more all-gather per weight).
-    if not mxfp8 and os.environ.get("NVTE_JAX_EP_OVERLAP_REGATHER", "0") == "1":
-        gathered = (w1, w2)
+    # Residual weights for the backward: the per-EP-rank weights as the GEMMs read them (already
+    # gathered over the data axes), so an FSDP backward does not gather them again.
     return out, total, recv_w, handle_mem, (*res, *gathered)
 
 

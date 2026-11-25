@@ -40,8 +40,6 @@ __all__ = [
 
 _atexit_registered = False
 
-# Communication SMs the EP/GEMM overlap path gives each NCCL EP call (PyTorch uses the same 24).
-_OVERLAP_COMM_SMS = 24
 # num_comm_sms of the bootstrapped group; the overlap path needs it > 0. None before bootstrap.
 _bootstrap_comm_sms = None
 # num_topk of the bootstrapped group (0 = unset; the overlap path needs the layer's top-k).
@@ -58,14 +56,6 @@ def ep_overlap_comm_sms() -> int:
     if _bootstrap_comm_sms is None:
         raise RuntimeError("EP overlap needs ep_bootstrap() first.")
     return _bootstrap_comm_sms
-
-
-def _overlap_requested_by_env() -> bool:
-    import os
-
-    return os.environ.get("NVTE_ENABLE_CUTEDSL_BACKEND", "0") == "1" and bool(
-        os.environ.get("NVTE_MOE_OVERLAP")
-    )
 
 
 def _allgather_uid(uid_arr, world_size, uid_size):
@@ -176,9 +166,10 @@ def ep_bootstrap(
             at least ep_size * max_tokens_per_rank * top_k to avoid drops.
         hidden_dim: Feature dimension of token tensors passed to ep_dispatch.
         max_token_dtype: Widest dtype the group will dispatch (only bfloat16 supported).
-        max_num_sms: SM budget for the dispatch/combine kernels; 0 = default (32), or 24 when
-            NVTE_ENABLE_CUTEDSL_BACKEND=1 and NVTE_MOE_OVERLAP are set (the EP/GEMM overlap
-            path needs an explicit budget).
+        max_num_sms: SM budget for the dispatch/combine kernels; 0 (default) lets NCCL EP
+            choose. The MoE block's EP/GEMM overlap path (``enable_ep_overlap``) needs an
+            explicit budget > 0 (24 is a good starting point on GB200); with 0 it falls back
+            to the non-overlapped path.
         drop_on_overflow: Drop tokens exceeding recv_capacity_per_rank instead of
             trapping on overflow. Dropped tokens are still counted in
             total_recv_tokens, so callers can detect overflow from it.
@@ -190,9 +181,6 @@ def ep_bootstrap(
         rank = jax.process_index()
     global _bootstrap_comm_sms, _bootstrap_num_topk
     _bootstrap_num_topk = int(num_topk)
-    if int(max_num_sms) == 0 and _overlap_requested_by_env():
-        # The EP/GEMM overlap kernels need an explicit SM split between NCCL EP and the GEMMs.
-        max_num_sms = _OVERLAP_COMM_SMS
     _bootstrap_comm_sms = int(max_num_sms)
     if jnp.dtype(max_token_dtype) != jnp.bfloat16:
         raise NotImplementedError(
