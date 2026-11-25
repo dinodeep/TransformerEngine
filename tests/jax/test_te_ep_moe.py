@@ -430,6 +430,7 @@ def _make_block(
     dispatch_quantization_recipe=None,
     enable_ep_overlap=False,
     intermediate_size=INTER,
+    ffn_checkpoint_names=(None, None, None),
     use_cudnn_fusion,
 ):
     kwargs = dict(
@@ -437,6 +438,9 @@ def _make_block(
         num_experts_per_tok=TOPK,
         intermediate_size=intermediate_size,
         enable_ep_overlap=enable_ep_overlap,
+        wi_0_checkpoint_name=ffn_checkpoint_names[0],
+        wi_1_checkpoint_name=ffn_checkpoint_names[1],
+        wo_checkpoint_name=ffn_checkpoint_names[2],
         mesh_resource=mesh_resource,
         apply_topk_weights_early=apply_topk_weights_early,
         aux_loss_coeff=aux_loss_coeff,
@@ -1279,7 +1283,6 @@ def test_ep_checkpoint_names(mesh, monkeypatch, make_block):
 @pytest.mark.parametrize(
     "block_kwargs, env, match",
     [
-        pytest.param(dict(dispatch_checkpoint_name="moe_dispatch"), {}, "checkpoint", id="ckpt"),
         pytest.param(dict(quantization="mxfp8", intermediate_size=INTER), {}, "of 256", id="ffn"),
         pytest.param(dict(quant_before_fsdp_ag=True), {}, "MXFP8 recipe", id="qbfag_bf16"),
         pytest.param({}, {"NCCL_EP_COMM_SMS": "8"}, "NCCL_EP_COMM_SMS", id="nccl_ep_sms"),
@@ -1301,6 +1304,87 @@ def test_ep_overlap_unmet_requirement_raises(
             _make_inputs(jax.random.PRNGKey(36)),
             jax.random.PRNGKey(37),
         )
+
+
+@pytest.mark.parametrize(
+    "saved",
+    [
+        ("moe_mlpwo",),
+        (),
+        ("moe_dispatch", "moe_mlpwo"),
+        ("moe_mlpwi_0", "moe_mlpwi_1", "moe_mlpwo"),
+    ],
+    ids=["wo", "none", "dispatch_wo", "wi_wo"],
+)
+@pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
+def test_ep_remat_policy(mesh, make_block, use_cudnn_fusion, quantization, saved):
+    """Names-based remat policies (``saved`` names are kept, the rest rematerialized; "wo" is
+    MaxText's custom remat: dispatch and FC1 remat, FC2 saved). With the overlap, the loss and
+    gradients match the un-rematerialized flag-off step, and the backward re-runs only the fused
+    dispatch+FC1 call when none of its names is saved (two in the step), never FC2+combine.
+
+    The flag-off path is checked only when every name is rematerialized: when some of its
+    residuals are saved and the dispatch is re-run, the re-run's received-row order can differ
+    from the saved residuals', which corrupts the gate and input gradients (known defect of the
+    regular path, measured relative error ~1)."""
+    _skip_unless_overlap_available(True, use_cudnn_fusion)
+    names = dict(
+        dispatch_checkpoint_name="moe_dispatch",
+        ffn_checkpoint_names=("moe_mlpwi_0", "moe_mlpwi_1", "moe_mlpwo"),
+    )
+    policy = jax.checkpoint_policies.save_only_these_names(*saved)
+    x = _make_inputs(jax.random.PRNGKey(42))
+    common = dict(
+        quantization_recipe=_quantization_recipe(quantization),
+        intermediate_size=OVERLAP_INTER,
+        **names,
+    )
+    variables, _, _, _ = _init_apply(make_block(**common), mesh, x, jax.random.PRNGKey(43))
+    results = {}
+    with _ctx(mesh):
+        x_sh = _shard_inputs(x, mesh)
+        for overlap in (False, True):
+            block = make_block(enable_ep_overlap=overlap, **common)
+            for remat in (False, True):
+
+                def loss_fn(v, x, block=block, remat=remat):
+                    apply = lambda v, x: block.apply(v, x)[0]
+                    if remat:
+                        apply = jax.checkpoint(apply, policy=policy)
+                    return jnp.mean(apply(v, x).astype(jnp.float32) ** 2)
+
+                step = jax.jit(jax.value_and_grad(loss_fn, argnums=(0, 1)))
+                hlo = step.lower(variables, x_sh).compile().as_text()
+                loss, (grads, grad_x) = step(variables, x_sh)
+                counts = {
+                    t: len(re.findall(rf'custom_call_target="{t}"', hlo)) for t in OVERLAP_TARGETS
+                }
+                results[overlap, remat] = (loss, grads, grad_x, counts)
+    for remat in (False, True):
+        assert set(results[False, remat][3].values()) == {0}
+    on, on_remat = results[True, False][3], results[True, True][3]
+    assert on == dict.fromkeys(OVERLAP_TARGETS, 1), on
+    rerun = not {"moe_dispatch", "moe_mlpwi_0", "moe_mlpwi_1"} & set(saved)
+    assert on_remat == dict(on, te_ep_dispatch_gemm_fwd_ffi=1 + rerun), on_remat
+    if saved:
+        del results[False, True]
+    tol = OVERLAP_GRAD_TOLERANCE[quantization]
+    ref_loss, ref_grads, ref_grad_x, _ = results[False, False]
+
+    def tensors(grads, grad_x):
+        named = {k: _unwrap(grads["params"][k]) for k in ("gate_kernel", "wi", "wo")}
+        named["x"] = grad_x
+        return {k: _to_global_numpy(v, mesh).astype(np.float32) for k, v in named.items()}
+
+    ref = tensors(ref_grads, ref_grad_x)
+    failures = []
+    for (overlap, remat), (loss, grads, grad_x, _) in results.items():
+        np.testing.assert_allclose(float(loss), float(ref_loss), rtol=tol["rtol"])
+        for name, value in tensors(grads, grad_x).items():
+            if not np.allclose(value, ref[name], **tol):
+                rel = np.max(np.abs(value - ref[name])) / max(np.max(np.abs(ref[name])), 1e-30)
+                failures.append((overlap, remat, name, float(rel)))
+    assert not failures, failures
 
 
 def test_ep_overlap_no_kernel_compile_at_execution(mesh, make_block, use_cudnn_fusion):

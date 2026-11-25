@@ -116,6 +116,9 @@ class _MoEBlock(TransformerEngineBase):
     dispatch_checkpoint_name : Optional[str]
         JAX rematerialization checkpoint name for the EP dispatch outputs.
         ``None`` leaves them unnamed.
+    wi_0_checkpoint_name, wi_1_checkpoint_name, wo_checkpoint_name : Optional[str]
+        JAX rematerialization checkpoint names for the FC1 (gate, up) and FC2 outputs, forwarded
+        to :func:`moe`. ``None`` leaves them unnamed.
     dispatch_quantization_recipe : Optional[Recipe]
         Recipe used to quantize tokens before EP dispatch so that the dispatch moves quantized
         data plus compact scales instead of high-precision activations. Only MXFP8 recipes are
@@ -191,6 +194,9 @@ class _MoEBlock(TransformerEngineBase):
     apply_topk_weights_early: bool = False
     recv_capacity_per_rank: Optional[int] = None
     dispatch_checkpoint_name: Optional[str] = None
+    wi_0_checkpoint_name: Optional[str] = None
+    wi_1_checkpoint_name: Optional[str] = None
+    wo_checkpoint_name: Optional[str] = None
     dispatch_quantization_recipe: Optional[Recipe] = None
     collect_expert_counts: bool = True
     enable_ep_overlap: bool = False
@@ -403,6 +409,9 @@ class _MoEBlock(TransformerEngineBase):
                 wo_kernel_axes=wo_kernel_axes,
                 dtype=self.dtype,
                 dispatch_checkpoint_name=self.dispatch_checkpoint_name,
+                wi_0_checkpoint_name=self.wi_0_checkpoint_name,
+                wi_1_checkpoint_name=self.wi_1_checkpoint_name,
+                wo_checkpoint_name=self.wo_checkpoint_name,
                 dispatch_quantizer=dispatch_quantizer,
                 enable_ep_overlap=self.enable_ep_overlap,
                 fc2_native_weight_layout=self.fc2_native_weight_layout,

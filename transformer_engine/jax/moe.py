@@ -1621,6 +1621,8 @@ def _moe_fwd_rule(
                     if quant_before_fsdp_ag
                     else None
                 ),
+                dispatch_checkpoint_name=dispatch_checkpoint_name,
+                fc1_checkpoint_names=(wi_0_checkpoint_name, wi_1_checkpoint_name),
             )
             output = with_sharding_constraint_by_logical_axes(output, input_axes)
             ctx = _Ctx(
@@ -2204,7 +2206,6 @@ def _ep_overlap_errors(
     quant_before_fsdp_ag,
     recv_capacity_per_rank,
     use_cudnn_fusion,
-    checkpoint_names,
     wi_kernel_axes=(),
     wo_kernel_axes=(),
 ) -> list:
@@ -2237,8 +2238,6 @@ def _ep_overlap_errors(
                 "quant_before_fsdp_ag needs the expert dimension of wi and wo sharded over (ep,"
                 " fsdp) (e.g. logical rule exp -> (ep, fsdp)); hidden-dim FSDP is not supported"
             )
-    if any(n is not None for n in checkpoint_names):
-        errors.append("TE checkpoint (remat) names are not supported")
     hidden = x.shape[-1]
     if mxfp8 and hidden % 512:
         errors.append(f"MXFP8 needs hidden_dim a multiple of 512, got {hidden}")
@@ -2380,13 +2379,35 @@ def _ep_overlap_fwd(
     mxfp8=False,
     quantizer_sets=None,
     quant_gather_axis=None,
+    dispatch_checkpoint_name=None,
+    fc1_checkpoint_names=(None, None),
 ):
     """Overlapped dispatch/FC1/SwiGLU/FC2/combine. MXFP8 quantizes the weights with the FC1/FC2
     kernel quantizers of ``quantizer_sets`` (rowwise and columnwise). With ``quant_gather_axis``
     (the FSDP axis, sharding the expert dimension together with EP), the weights enter as their
     local shards, are quantized there and gathered as MXFP8 (``_gather_quantized_weight``).
-    Returns (output [B,S,H], total_recv_tokens, recv_topk_weights, handle_mem, residuals)."""
+    Returns (output [B,S,H], total_recv_tokens, recv_topk_weights, handle_mem, residuals).
+
+    TE checkpoint names tag the residuals of the fused dispatch+FC1 call: the routing state
+    (``handle_mem``), received tokens (and their MXFP8 scales), received routing weights,
+    per-expert counts, the FC1 output and, for BF16, the SwiGLU output (MXFP8 recomputes the
+    activation in the backward). The wo name tags nothing: the backward does not read FC2's
+    output. Under a names-based remat policy JAX rebuilds unsaved residuals by re-running the
+    fused dispatch+FC1 call only; FC2+combine is never re-run.
+
+    A re-run dispatch may place the received rows in a different order, so the residuals must be
+    saved or rebuilt together: each carries every given name (dispatch, wi_0, wi_1), nested, and
+    is saved when the policy saves any of them. A mixed policy (dispatch saved and FC1
+    rematerialized, or the reverse) therefore saves all of them."""
     from jax.experimental.shard_map import shard_map
+
+    residual_names = (dispatch_checkpoint_name, *fc1_checkpoint_names)
+
+    def _named(values):
+        for name in residual_names:
+            if name is not None:
+                values = tuple(checkpoint_name(v, name) for v in values)
+        return values
 
     H = x.shape[-1]
     K = cfg.top_k
@@ -2474,6 +2495,9 @@ def _ep_overlap_fwd(
                 handle_mem, act_out, recv_w, offsets, w2_l, num_tokens=T, top_k=K, alignment=align
             )
             weight_res = (w1_l, w2_l)
+        recv_tokens, recv_w, counts, handle_mem, gemm_out, act_out = _named(
+            (recv_tokens, recv_w, counts, handle_mem, gemm_out, act_out)
+        )
         total = offsets[-1:]
         return (
             out.reshape(x_l.shape),
@@ -2798,10 +2822,16 @@ def moe(
         ``NVTE_ENABLE_CUTEDSL_BACKEND=1`` and ``NVTE_MOE_OVERLAP`` (else TE raises while the GEMMs
         compile at trace time); no ``NCCL_EP_*_SMS`` override;
         ``ep_bootstrap(num_topk=top_k, max_num_sms>0)``; BF16 or MXFP8 (E4M3) recipe; BF16
-        inputs and weights; SwiGLU; no biases or checkpoint names; hidden % 256 == 0 and
+        inputs and weights; SwiGLU; no biases; hidden % 256 == 0 and
         FFN % 64 == 0 (MXFP8: 512 and 256); recv_capacity_per_rank % 256 == 0. Matches the
         regular path within BF16 rounding (the routing weight is applied
-        before FC2). Defaults to ``False``.
+        before FC2). TE checkpoint names: the dispatch, wi_0 and wi_1 names all tag the
+        residuals of the fused dispatch+FC1 call (routing state, received tokens/scales/weights,
+        counts, FC1 output and, for BF16, the SwiGLU output), which are saved when the policy
+        saves any of these names and otherwise rebuilt by re-running only the fused
+        dispatch+FC1 call (never FC2+combine); the wo name tags nothing (the backward does not
+        read FC2's output).
+        Defaults to ``False``.
     fc2_native_weight_layout : bool
         ``True`` selects FC2 storage ``wo`` [E, H, F] (the overlap GEMM's layout) instead of
         [E, F, H]. With ``enable_ep_overlap``, use it together with
@@ -2913,12 +2943,6 @@ def moe(
                 use_cudnn_fusion=use_cudnn_fusion,
                 wi_kernel_axes=wi_kernel_axes,
                 wo_kernel_axes=wo_kernel_axes,
-                checkpoint_names=(
-                    wi_0_checkpoint_name,
-                    wi_1_checkpoint_name,
-                    wo_checkpoint_name,
-                    dispatch_checkpoint_name,
-                ),
             )
             if overlap_errors:
                 raise ValueError("enable_ep_overlap=True: " + "; ".join(overlap_errors))
