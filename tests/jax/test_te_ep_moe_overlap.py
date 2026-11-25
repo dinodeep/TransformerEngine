@@ -126,7 +126,7 @@ def layout(request):
             recv_capacity_per_rank=recv_cap,
             hidden_dim=HIDDEN,
             max_token_dtype=DTYPE,
-            num_topk=TOPK,
+            num_topk=int(os.environ.get("OVERLAP_TEST_NUM_TOPK", TOPK)),
         )
     record_ep_bootstrap_signature_for_moe(
         num_experts=NUM_EXPERTS,
@@ -240,12 +240,17 @@ def test_overlap_matches_flag_off(layout, score_function):
 
 
 def test_ineligible_layer_falls_back(layout):
-    """A layer the overlap cannot run (FFN bias) warns and matches the flag-off block exactly."""
+    """A layer the overlap cannot run warns and matches the flag-off block bitwise.
+
+    The ineligibility used is a dispatch checkpoint name (unsupported by the overlap path), which
+    leaves the regular path's math unchanged.
+    """
+    kw = dict(dispatch_checkpoint_name="moe_dispatch")
     with _ctx(layout):
-        x, variables = _setup(layout, key=3, use_ffn_bias=True)
-        ref = jax.jit(_block(False, use_ffn_bias=True).apply)(variables, x)[0]
-        with pytest.warns(UserWarning, match="EP overlap skipped.*biases"):
-            fn = jax.jit(_block(True, use_ffn_bias=True).apply)
+        x, variables = _setup(layout, key=3, **kw)
+        ref = jax.jit(_block(False, **kw).apply)(variables, x)[0]
+        with pytest.warns(UserWarning, match="EP overlap skipped.*checkpoint names"):
+            fn = jax.jit(_block(True, **kw).apply)
             out = fn(variables, x)[0]
         assert "te_ep_dispatch_gemm_fwd_ffi" not in fn.lower(variables, x).as_text()
     np.testing.assert_array_equal(_global(out), _global(ref))
