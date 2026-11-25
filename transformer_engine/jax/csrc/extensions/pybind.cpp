@@ -212,6 +212,12 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
         pybind11::arg("recv_capacity"), pybind11::arg("with_weight_grad"), pybind11::arg("mxfp8"),
         pybind11::arg("top_k"), pybind11::arg("dispatch_output_per_expert_alignment"),
         pybind11::arg("topk_idx_dtype"), pybind11::call_guard<pybind11::gil_scoped_release>());
+  m.def("ep_overlap_compile", &EpOverlapCompile, pybind11::arg("hidden_dim"),
+        pybind11::arg("ffn_dim"), pybind11::arg("num_local_experts"),
+        pybind11::arg("recv_capacity"), pybind11::arg("with_weight_grad"),
+        pybind11::arg("fp32_weight_grad"), pybind11::arg("top_k"),
+        pybind11::arg("dispatch_output_per_expert_alignment"), pybind11::arg("topk_idx_dtype"),
+        pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("get_ep_instance_state_type_id", &GetEpInstanceStateTypeIdCapsule);
   m.def("get_ep_instance_state_type_info", &GetEpInstanceStateTypeInfoCapsule);
 #endif  // NVTE_WITH_NCCL_EP

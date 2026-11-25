@@ -63,21 +63,24 @@ def ep_overlap_env_reason():
 @functools.lru_cache(maxsize=None)
 def ep_overlap_workspace_size(hidden, ffn, num_local_experts, recv_capacity, top_k, alignment,
                               topk_idx_dtype=jnp.int32):
-    """Workspace bytes for every overlap call of a layer. Compiles the CuTeDSL GEMMs on first use,
-    so it runs at trace time, after ep_bootstrap (it needs the EP group)."""
-    return int(
-        transformer_engine_jax.ep_overlap_workspace_size(
-            int(hidden),
-            int(ffn),
-            int(num_local_experts),
-            int(recv_capacity),
-            True,
-            False,
-            int(top_k),
-            int(alignment),
-            int(jax_dtype_to_te_dtype(jnp.dtype(topk_idx_dtype))),
-        )
+    """Workspace bytes for every overlap call of a layer.
+
+    Also compiles, ahead of time, every CuTeDSL GEMM the layer's four calls will launch
+    (``nvte_ep_overlap_compile``): the calls themselves would compile on first use, re-entering
+    Python from an XLA execution thread (or a CUDA-graph capture). Runs at trace time, once per
+    layer configuration, after ep_bootstrap (it needs the EP group)."""
+    args = dict(
+        hidden_dim=int(hidden),
+        ffn_dim=int(ffn),
+        num_local_experts=int(num_local_experts),
+        recv_capacity=int(recv_capacity),
+        with_weight_grad=True,
+        top_k=int(top_k),
+        dispatch_output_per_expert_alignment=int(alignment),
+        topk_idx_dtype=int(jax_dtype_to_te_dtype(jnp.dtype(topk_idx_dtype))),
     )
+    transformer_engine_jax.ep_overlap_compile(fp32_weight_grad=False, **args)
+    return int(transformer_engine_jax.ep_overlap_workspace_size(mxfp8=False, **args))
 
 
 def _attrs(top_k, alignment, topk_idx_dtype):

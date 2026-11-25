@@ -226,6 +226,10 @@ size_t EpHandleMemSize(int top_k, size_t dispatch_output_per_expert_alignment);
 size_t EpOverlapWorkspaceSize(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
                               size_t recv_capacity, bool with_weight_grad, bool mxfp8, int top_k,
                               size_t dispatch_output_per_expert_alignment, int topk_idx_dtype);
+// Compile every overlap GEMM of a BF16 layer ahead of the calls (nvte_ep_overlap_compile).
+void EpOverlapCompile(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
+                      size_t recv_capacity, bool with_weight_grad, bool fp32_weight_grad, int top_k,
+                      size_t dispatch_output_per_expert_alignment, int topk_idx_dtype);
 
 // EpInstanceState type_id / type_info capsules for jax.ffi.register_ffi_type.
 pybind11::capsule GetEpInstanceStateTypeIdCapsule();

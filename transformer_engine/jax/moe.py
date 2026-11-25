@@ -1615,6 +1615,7 @@ def _moe_fwd_rule(
                     cfg=cfg,
                     recv_pr=recv_pr,
                     native_layout=cudnn_native_weight_layout,
+                    fc2_native_layout=use_ep_overlap == _EP_OVERLAP_FC2_NATIVE,
                 )
             )
             output = with_sharding_constraint_by_logical_axes(output, input_axes)
@@ -1649,6 +1650,7 @@ def _moe_fwd_rule(
                 "x_shape": x.shape,
                 "recv_pr": recv_pr,
                 "cudnn_native_weight_layout": cudnn_native_weight_layout,
+                "fc2_native_layout": use_ep_overlap == _EP_OVERLAP_FC2_NATIVE,
             }
             return (output, aux_loss, total_recv_tokens, expert_counts), (ctx, static)
 
@@ -1916,6 +1918,7 @@ def _moe_bwd_rule(
                 dp_axes=tuple(data_parallelism_axes),
                 cfg=ctx.cfg,
                 native_layout=static["cudnn_native_weight_layout"],
+                fc2_native_layout=static["fc2_native_layout"],
             )
             d_wi_0_bias = d_wi_1_bias = d_wo_bias = None
         else:
@@ -2175,6 +2178,9 @@ def _moe_aux_loss_bwd(ctx, d_aux_loss, K, num_experts, mesh, ep2_spec):
 # than to FC2's output, so outputs match the unfused path within BF16 rounding, not bitwise.
 
 _EP_OVERLAP_SM_ARCHS = (100, 103, 107)
+# Static ``use_ep_overlap`` values of the custom VJP: off, on with wo [E, F, H], on with the
+# FC2 weight stored as the overlap GEMM reads it, wo [E, H, F] (``fc2_native_weight_layout``).
+_EP_OVERLAP_OFF, _EP_OVERLAP_ON, _EP_OVERLAP_FC2_NATIVE = 0, 1, 2
 
 
 def _ep_overlap_rejection_reasons(
@@ -2292,7 +2298,7 @@ def _ep_overlap_fc1_weight_grad(d_w1, native_layout):
 
 def _ep_overlap_fwd(
     x, topk_idx_3d, topk_w_3d, wi, wo, *, mesh, batch_axes, ep_axis, cfg, recv_pr,
-    native_layout,
+    native_layout, fc2_native_layout=False,
 ):
     """Overlapped dispatch/FC1/SwiGLU/FC2/combine. Returns (output [B,S,H], total_recv_tokens,
     recv_topk_weights, handle_mem, residuals)."""
@@ -2302,7 +2308,7 @@ def _ep_overlap_fwd(
     K = cfg.top_k
     align = cfg.dispatch_output_per_expert_alignment
     w1 = _ep_overlap_fc1_weight(wi, native_layout)
-    w2 = wo.transpose(0, 2, 1)
+    w2 = wo if fc2_native_layout else wo.transpose(0, 2, 1)
     tok = P(batch_axes, None, None)
     row = P(batch_axes)
     row2 = P(batch_axes, None)
@@ -2343,7 +2349,7 @@ def _ep_overlap_fwd(
 
 def _ep_overlap_bwd(
     d_output, handle_mem, recv_w, residuals, *, mesh, batch_axes, ep_axis, dp_axes, cfg,
-    native_layout,
+    native_layout, fc2_native_layout=False,
 ):
     """Backward of :func:`_ep_overlap_fwd`. Returns (d_x, d_topk_w [B*S... ,K], d_wi, d_wo)."""
     from jax.experimental.shard_map import shard_map
@@ -2379,7 +2385,7 @@ def _ep_overlap_bwd(
         check_rep=False,
     )(d_output, handle_mem, recv_w, recv_tokens, gemm_out, act_out, counts, w1, w2)
     d_wi = _ep_overlap_fc1_weight_grad(d_w1, native_layout)
-    d_wo = d_w2.transpose(0, 2, 1)
+    d_wo = d_w2 if fc2_native_layout else d_w2.transpose(0, 2, 1)
     return d_x, d_topk_w, d_wi, d_wo
 
 
@@ -2487,6 +2493,7 @@ def moe(
     cudnn_native_weight_layout: Optional[bool] = None,
     dispatch_quantizer: Optional[Quantizer] = None,
     enable_ep_overlap: bool = False,
+    fc2_native_weight_layout: bool = False,
 ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray, jnp.ndarray]:
     """Run a full MoE block under a single fused custom_vjp on the TE EP path.
 
@@ -2587,7 +2594,9 @@ def moe(
     ``enable_ep_overlap=True`` runs dispatch -> FC1 -> SwiGLU -> FC2 -> combine (and the backward)
     as NCCL EP calls overlapped with CuTeDSL grouped GEMMs (needs NVTE_ENABLE_CUTEDSL_BACKEND=1,
     NVTE_MOE_OVERLAP, BF16, SwiGLU, no biases, hidden % 256 == 0, FFN % 64 == 0). Ineligible calls
-    warn and run the regular path.
+    warn and run the regular path. The overlap GEMMs read FC1 as [E, 2F, H] (gate/up in 32-row
+    blocks, i.e. ``cudnn_native_weight_layout=True``) and FC2 as [E, H, F]
+    (``fc2_native_weight_layout=True``); weights stored in other layouts are converted every pass.
 
     See module docstring for the rest of the parameter semantics and the
     surrounding design rationale.
@@ -2655,7 +2664,7 @@ def moe(
             )
             use_cudnn_jax_fusion = _select_cudnn_jax_fusion(rejection_reasons)
 
-        use_ep_overlap = False
+        use_ep_overlap = _EP_OVERLAP_OFF
         if enable_ep_overlap:
             overlap_reasons = _ep_overlap_rejection_reasons(
                 x,
@@ -2687,8 +2696,14 @@ def moe(
                     stacklevel=2,
                 )
             else:
-                use_ep_overlap = True
+                use_ep_overlap = (
+                    _EP_OVERLAP_FC2_NATIVE if fc2_native_weight_layout else _EP_OVERLAP_ON
+                )
                 use_cudnn_jax_fusion = False
+        if fc2_native_weight_layout and not use_ep_overlap:
+            # wo is stored [E, H, F] (the overlap GEMM's layout); the regular path reads [E, F, H].
+            wo = wo.transpose(0, 2, 1)
+            wo_kernel_axes = (wo_kernel_axes[0], wo_kernel_axes[2], wo_kernel_axes[1])
 
         output, aux_loss, total_recv_tokens, expert_counts = _moe(
             x,

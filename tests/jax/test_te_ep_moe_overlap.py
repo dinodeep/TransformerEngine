@@ -144,11 +144,47 @@ def layout(request):
         multihost_utils.sync_global_devices(f"overlap_{request.param}_finalized")
 
 
+def _install_compile_counter():
+    """Wrap the CuTeDSL EP GEMM entry points that C++ calls on a kernel-cache miss.
+
+    Returns a dict whose "calls" counts every entry (compile, register or layout query)."""
+    import tvm_ffi
+    from transformer_engine.common.CuTeDSL.ep_gemm import (
+        dispatch_gemm,
+        combine_gemm,
+        requantize,
+        wgrad_gemm,
+    )
+
+    counter = {"calls": 0}
+    for fn in (
+        dispatch_gemm.get_ep_dispatch_gemm_function,
+        dispatch_gemm.get_ep_dispatch_gemm_workspace_layout,
+        combine_gemm.get_ep_combine_gemm_function,
+        combine_gemm.get_ep_combine_gemm_workspace_layout,
+        wgrad_gemm.get_ep_wgrad_function,
+        wgrad_gemm.get_ep_wgrad_workspace_layout,
+        wgrad_gemm.get_ep_wgrad_reads_descriptors,
+        requantize.get_ep_requant_function,
+    ):
+
+        def wrapped(*args, _fn=fn):
+            counter["calls"] += 1
+            counter.setdefault("log", []).append((_fn.__name__, args))
+            return _fn(*args)
+
+        tvm_ffi.register_global_func(fn.__name__, wrapped, override=True)
+    return counter
+
+
+_COMPILE_COUNTER = _install_compile_counter()
+
+
 def _block(enable, **kw):
     return MoEBlock(
         num_experts=NUM_EXPERTS,
         num_experts_per_tok=TOPK,
-        intermediate_size=INTER,
+        intermediate_size=kw.pop("intermediate_size", INTER),
         dtype=DTYPE,
         input_axes=("batch", None, None),
         use_cudnn_fusion=False,
@@ -254,3 +290,91 @@ def test_ineligible_layer_falls_back(layout):
             out = fn(variables, x)[0]
         assert "te_ep_dispatch_gemm_fwd_ffi" not in fn.lower(variables, x).as_text()
     np.testing.assert_array_equal(_global(out), _global(ref))
+
+
+def _to_standard(gv):
+    """Map ep_overlap_weight_layout gradients/params back to the default layout."""
+    from transformer_engine.jax.cpp_extensions import unpack_gated_activation_pair
+
+    p = dict(gv["params"])
+    gate, up = unpack_gated_activation_pair(p["wi"].transpose(0, 2, 1))
+    p["wi"] = jnp.concatenate((gate, up), axis=-1)
+    p["wo"] = p["wo"].transpose(0, 2, 1)
+    return {"params": p}
+
+
+def test_overlap_native_weight_layout(layout):
+    """ep_overlap_weight_layout stores weights as the overlap GEMMs read them (no per-step
+    conversion in the graph); it initializes the same values as the default layout, matches the
+    default-layout flag-off block, and its own flag-off fallback is bitwise equal to it."""
+    mesh = layout["mesh"]
+    with _ctx(layout):
+        x, variables = _setup(layout, key=5)
+        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(9), x.shape, DTYPE), x.sharding)
+        native_block = _block(True, ep_overlap_weight_layout=True)
+        abstract = jax.eval_shape(native_block.init, jax.random.PRNGKey(6), x)
+        shardings = nn.logical_to_mesh_sharding(nn.get_partition_spec(abstract), mesh, layout["rules"])
+        native_vars = nn.unbox(
+            jax.jit(native_block.init, out_shardings=shardings)(jax.random.PRNGKey(6), x)
+        )
+        # Same init key in both layouts gives the same values.
+        for k in ("wi", "wo", "gate_kernel"):
+            np.testing.assert_array_equal(
+                _global(_to_standard(native_vars)["params"][k]), _global(variables["params"][k])
+            )
+        _, ((_, ref_out), (ref_gv, ref_gx)) = _loss_and_grads(_block(False), variables, x, dy)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*EP overlap skipped.*")
+            on_fn, ((_, out), (gv, gx)) = _loss_and_grads(native_block, native_vars, x, dy)
+        hlo = on_fn.lower(native_vars, x).as_text()
+        assert "te_ep_dispatch_gemm_fwd_ffi" in hlo
+        # Fallback with the native layout (flag off) converts back and is bitwise the default.
+        _, ((_, fb_out), (fb_gv, fb_gx)) = _loss_and_grads(
+            _block(False, ep_overlap_weight_layout=True), native_vars, x, dy
+        )
+    np.testing.assert_array_equal(_global(fb_out), _global(ref_out))
+    np.testing.assert_array_equal(_global(fb_gx), _global(ref_gx))
+    gv_std = _to_standard(gv)
+    errs = {
+        "out": _rel_err(out, ref_out),
+        "x": _rel_err(gx, ref_gx),
+        "wi": _rel_err(gv_std["params"]["wi"], ref_gv["params"]["wi"]),
+        "wo": _rel_err(gv_std["params"]["wo"], ref_gv["params"]["wo"]),
+        "gate_kernel": _rel_err(gv["params"]["gate_kernel"], ref_gv["params"]["gate_kernel"]),
+    }
+    if jax.process_index() == 0:
+        print(f"[{layout['name']} native layout] max rel err vs flag-off: {errs}", flush=True)
+    for k, e in errs.items():
+        assert np.isfinite(e) and e <= REL_TOL[k], f"{k}: rel err {e} > {REL_TOL[k]}"
+
+
+def test_no_kernel_compile_at_execution(layout):
+    """The CuTeDSL GEMMs compile while jit traces (the workspace-size query); executing the
+    compiled step, first and later, never re-enters the Python compile/register entry points."""
+    # An FFN size no other test uses, so this layer's GEMM configurations are new.
+    inter = 384 if layout["name"] == "ep4" else 448
+    with _ctx(layout):
+        x, variables = _setup(layout, key=11, intermediate_size=inter)
+        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(12), x.shape, DTYPE), x.sharding)
+        block = _block(True, intermediate_size=inter)
+        before_trace = _COMPILE_COUNTER["calls"]
+
+        def loss(v, x):
+            out = block.apply(v, x)[0]
+            return jnp.sum(out.astype(jnp.float32) * dy.astype(jnp.float32))
+
+        compiled = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(variables, x).compile()
+        after_trace = _COMPILE_COUNTER["calls"]
+        for _ in range(3):
+            jax.block_until_ready(compiled(variables, x))
+        after_exec = _COMPILE_COUNTER["calls"]
+    if jax.process_index() == 0:
+        print(f"[{layout['name']}] CuTeDSL entry calls: during trace+compile"
+              f" {after_trace - before_trace}, during 3 executions {after_exec - after_trace}",
+              flush=True)
+    if jax.process_index() == 0:
+        for i, (name, args) in enumerate(_COMPILE_COUNTER["log"][-(after_exec - before_trace):]):
+            print(f"  entry {i} {'EXEC' if i >= after_trace - before_trace else 'TRACE'}: {name}"
+                  f" {args}", flush=True)
+    assert after_trace > before_trace, "the new GEMM configuration was not compiled at trace time"
+    assert after_exec == after_trace, "a CuTeDSL GEMM was compiled/looked up at execution time"

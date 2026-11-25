@@ -618,6 +618,83 @@ size_t nvte_ep_overlap_workspace_size(size_t hidden_dim, size_t ffn_dim, size_t 
   return need;
 }
 
+// Compiles (or finds cached) every GEMM, GEMM tail and weight-gradient launch the four BF16 calls
+// of a layer make, with the same configurations those calls build, so a later call only looks up
+// cached kernels. Mirrors the BF16 branches of the four entry points below; keep them in sync.
+void nvte_ep_overlap_compile(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
+                             size_t recv_capacity, int with_weight_grad, int fp32_weight_grad,
+                             const NVTEEpLayerConfig* layer_cfg) {
+  NVTE_API_CALL(nvte_ep_overlap_compile);
+  using namespace transformer_engine;
+  const size_t ne = num_local_experts;
+  const size_t rows = recv_capacity;
+  const NVTEScalingMode mx = NVTE_DELAYED_TENSOR_SCALING;
+  const bool wg = with_weight_grad != 0;
+  ep::WorkspaceLayout layout;
+  // The weight-gradient launches of a backward call (see make_wgrad and launch_wgrad).
+  const auto compile_wgrad = [&](const EpGemmContext& ctx, size_t m, size_t n,
+                                 std::initializer_list<std::tuple<int, bool, size_t>> launches) {
+    const size_t routed_rows =
+        static_cast<size_t>(ctx.group.max_tokens_per_rank) * ctx.layer_cfg.top_k;
+    const ep::EpWgradConfig base{rows,  m,  n,     ne, 1, fp32_weight_grad != 0, false, false, 0,
+                                 mx, false, ctx.alignment(), routed_rows};
+    NVTE_CHECK(base.workspace_layout().has_value(),
+               "cannot query the weight-gradient workspace layout");
+    for (const auto& [clusters, wait_primary_at_start, ready_slot_rows] : launches) {
+      if (clusters <= 0) continue;
+      ep::EpWgradConfig config = base;
+      config.num_clusters = clusters;
+      config.wait_primary_at_start = wait_primary_at_start;
+      config.ready_slot_rows = ready_slot_rows;
+      config.descriptors_only = false;
+      get_gemm(config, &layout);
+    }
+  };
+  // nvte_ep_dispatch_gemm_fwd: FC1 + SwiGLU beside the dispatch, and its tail.
+  {
+    const EpGemmContext ctx = make_context(layer_cfg, &NVTEEpGroupConfig::dispatch_fwd_num_sms);
+    const ep::EpDispatchGemmConfig config{rows, hidden_dim,       2 * ffn_dim,
+                                          ne,   ctx.num_clusters, false,
+                                          mx,   ctx.alignment(),  dispatch_writes_layout(ctx, ne)};
+    get_gemm(config, &layout);
+    const int tail_clusters = ctx.all_clusters - ctx.num_clusters;
+    if (tail_clusters > 0) get_tail_gemm(config, tail_clusters, layout, "the GEMM tail");
+  }
+  // nvte_ep_combine_gemm_fwd: FC2 beside the combine.
+  {
+    const EpGemmContext ctx = make_context(layer_cfg, &NVTEEpGroupConfig::combine_fwd_num_sms);
+    get_gemm(combine_fwd_config(ctx, rows, ffn_dim, hidden_dim, ne, mx), &layout);
+  }
+  // nvte_ep_combine_gemm_bwd (BF16): FC2 dgrad + dSwiGLU; the FC2 weight gradient [hidden, ffn],
+  // tail then base, both behind the dispatch flags.
+  {
+    const EpGemmContext ctx = make_context(layer_cfg, &NVTEEpGroupConfig::dispatch_bwd_num_sms);
+    get_gemm(ep::EpDispatchGemmConfig{rows, hidden_dim, ffn_dim, ne, ctx.num_clusters, true, mx,
+                                      ctx.alignment()},
+             &layout);
+    if (wg) {
+      compile_wgrad(ctx, hidden_dim, ffn_dim,
+                    {{ctx.all_clusters - ctx.num_clusters, false, ctx.ready_slot_rows()},
+                     {ctx.num_clusters, false, ctx.ready_slot_rows()}});
+    }
+  }
+  // nvte_ep_dispatch_gemm_bwd: FC1 dgrad; the FC1 weight gradient [2 * ffn, hidden], base then
+  // tail.
+  {
+    const EpGemmContext ctx = make_context(layer_cfg, &NVTEEpGroupConfig::combine_bwd_num_sms);
+    const bool plain = wg && ctx.num_clusters > 0;
+    const size_t n_chunk = plain ? 0 : combine_chunk(hidden_dim);
+    get_gemm(ep::EpCombineGemmConfig{rows, 2 * ffn_dim, hidden_dim, ne,
+                                     wg ? ctx.all_clusters : ctx.num_clusters, n_chunk,
+                                     !plain && kCombineAtGemmEntry, true, mx, ctx.alignment()},
+             &layout);
+    if (wg) {
+      compile_wgrad(ctx, 2 * ffn_dim, hidden_dim,
+                    {{ctx.num_clusters, true, 0}, {ctx.all_clusters - ctx.num_clusters, false, 0}});
+    }
+  }
+}
+
 void nvte_ep_dispatch_gemm_fwd(NVTETensor handle_mem, const NVTETensor topk_idx,
                                const NVTETensor tokens, NVTECommWindow tokens_win,
                                const NVTETensor topk_weights, const NVTETensor weight,
@@ -1087,6 +1164,10 @@ extern "C" {
 
 size_t nvte_ep_overlap_workspace_size(size_t, size_t, size_t, size_t, int, int,
                                       const NVTEEpLayerConfig*) {
+  ep_gemm_not_built();
+}
+
+void nvte_ep_overlap_compile(size_t, size_t, size_t, size_t, int, int, const NVTEEpLayerConfig*) {
   ep_gemm_not_built();
 }
 

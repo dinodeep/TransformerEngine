@@ -788,6 +788,18 @@ size_t EpOverlapWorkspaceSize(size_t hidden_dim, size_t ffn_dim, size_t num_loca
                                         with_weight_grad ? 1 : 0, mxfp8 ? 1 : 0, &layer_cfg);
 }
 
+void EpOverlapCompile(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
+                      size_t recv_capacity, bool with_weight_grad, bool fp32_weight_grad, int top_k,
+                      size_t dispatch_output_per_expert_alignment, int topk_idx_dtype) {
+  NVTEEpLayerConfig layer_cfg{
+      .struct_size = sizeof(NVTEEpLayerConfig),
+      .top_k = top_k,
+      .dispatch_output_per_expert_alignment = dispatch_output_per_expert_alignment,
+      .topk_idx_dtype = static_cast<NVTEDType>(topk_idx_dtype)};
+  nvte_ep_overlap_compile(hidden_dim, ffn_dim, num_local_experts, recv_capacity,
+                          with_weight_grad ? 1 : 0, fp32_weight_grad ? 1 : 0, &layer_cfg);
+}
+
 // Dispatch overlapped with FC1 + SwiGLU (act_out = silu(gate) * up * prob).
 Error_Type EpDispatchGemmFwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
                                 Buffer_Type topk_idx, Buffer_Type tokens, Buffer_Type topk_weights,
