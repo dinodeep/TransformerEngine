@@ -341,6 +341,21 @@ ncclEpHandle_t EPBackend::open_handle(void* handle_mem, size_t handle_mem_size, 
   return handle;
 }
 
+void EPBackend::warm_handle_scratch(NVTEEpLayerConfig layer_cfg) {
+  const size_t size = handle_mem_size(layer_cfg);
+  void* handle_mem = nullptr;
+  NVTE_CHECK_CUDA(cudaMalloc(&handle_mem, size));
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    NVTE_CHECK(initialized_, "EPBackend not initialized");
+    ScopedHandle guard(open_handle(handle_mem, size, layer_cfg.top_k,
+                                   layer_cfg.dispatch_output_per_expert_alignment),
+                       /*owned=*/true);
+  }
+  NVTE_CHECK_CUDA(cudaDeviceSynchronize());
+  NVTE_CHECK_CUDA(cudaFree(handle_mem));
+}
+
 ncclEpHandle_t EPBackend::import_handle_locked(void* handle_mem, size_t handle_mem_size,
                                                int num_tokens, NVTEEpLayerConfig layer_cfg) {
   size_t hm_sizes[1] = {handle_mem_size};

@@ -109,6 +109,10 @@ class EPBackend {
                    const EpSignal* dispatch_signal, const NVTEEpLayerConfig* layer_cfg,
                    cudaStream_t stream);
 
+  // Opens and closes a handle for layer_cfg outside any CUDA graph capture, so NCCL EP allocates
+  // the group's lazily created handle scratch before a captured call needs it.
+  void warm_handle_scratch(NVTEEpLayerConfig layer_cfg);
+
   const NVTEEpGroupConfig& group_config() const { return group_config_; }
 
   ~EPBackend();

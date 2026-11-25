@@ -636,6 +636,9 @@ void nvte_ep_overlap_compile(size_t hidden_dim, size_t ffn_dim, size_t num_local
     check_mxfp8_dims(hidden_dim, ffn_dim,
                      ep::normalize_layer_config(layer_cfg).dispatch_output_per_expert_alignment);
   }
+  // The overlapped calls run inside CUDA graphs (XLA command buffers); let NCCL EP allocate the
+  // group's handle scratch now, at trace time, instead of on a first captured call.
+  ep::EPBackend::get().warm_handle_scratch(ep::normalize_layer_config(layer_cfg));
   // The weight-gradient launches of a backward call (see make_wgrad and launch_wgrad).
   const auto compile_wgrad = [&](const EpGemmContext& ctx, size_t m, size_t n,
                                  std::initializer_list<std::tuple<int, bool, size_t>> launches) {
