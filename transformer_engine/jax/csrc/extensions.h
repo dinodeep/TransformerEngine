@@ -228,8 +228,9 @@ size_t EpOverlapWorkspaceSize(size_t hidden_dim, size_t ffn_dim, size_t num_loca
                               size_t dispatch_output_per_expert_alignment, int topk_idx_dtype);
 // Compile every overlap GEMM of a BF16 layer ahead of the calls (nvte_ep_overlap_compile).
 void EpOverlapCompile(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
-                      size_t recv_capacity, bool with_weight_grad, bool fp32_weight_grad, int top_k,
-                      size_t dispatch_output_per_expert_alignment, int topk_idx_dtype);
+                      size_t recv_capacity, bool with_weight_grad, bool fp32_weight_grad,
+                      bool mxfp8, int top_k, size_t dispatch_output_per_expert_alignment,
+                      int topk_idx_dtype);
 
 // EpInstanceState type_id / type_info capsules for jax.ffi.register_ffi_type.
 pybind11::capsule GetEpInstanceStateTypeIdCapsule();
@@ -247,6 +248,10 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmFwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmFwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmBwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmBwdHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmFwdMxfp8Handler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmFwdMxfp8Handler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmBwdMxfp8Handler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmBwdMxfp8Handler);
 
 // EP-specific execute stage of the borrowed-comm bootstrap op (see
 // tex.ep.use_nccl_comm_from_xla). The prepare stage is the generic

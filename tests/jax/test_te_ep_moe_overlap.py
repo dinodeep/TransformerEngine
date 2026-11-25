@@ -580,3 +580,127 @@ def test_run_to_run_reproducibility(layout, enable):
     _assert_same(gx1, gx2, "x", enable)
     for k in ("wi", "wo", "gate_kernel"):
         _assert_same(gp1[k], gp2[k], k, enable)
+
+
+# ----------------------------------------------------------------------------- MXFP8
+
+
+layout_mr_placeholder = None
+
+
+def _mxfp8_block(enable, **kw):
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    return MoEBlock(
+        num_experts=NUM_EXPERTS,
+        num_experts_per_tok=TOPK,
+        intermediate_size=INTER,
+        dtype=DTYPE,
+        input_axes=("batch", None, None),
+        use_cudnn_fusion=False,
+        collect_expert_counts=False,
+        enable_ep_overlap=enable,
+        cudnn_native_weight_layout=True,
+        fc2_native_weight_layout=True,
+        quantization_recipe=MXFP8BlockScaling(),
+        mesh_resource=layout_mr_placeholder,
+        **kw,
+    )
+
+
+# MXFP8 vs MXFP8 (both quantize every GEMM operand, at different points: the overlap quantizes
+# SwiGLU's output before applying the routing weight in FC2's epilogue, and requantizes dY and the
+# activations columnwise for the weight gradients), and each vs the BF16 overlap reference.
+MXFP8_TOL = {"out": 1.5e-1, "x": 1.5e-1, "wi": 1.5e-1, "wo": 1.5e-1, "gate_kernel": 1.5e-1}
+
+
+@pytest.mark.parametrize("quant_before_fsdp_ag", [False, True], ids=["gather_bf16", "gather_mxfp8"])
+def test_mxfp8_overlap_matches_flag_off(layout, quant_before_fsdp_ag):
+    """MXFP8 recipe: flag-on output and gradients match flag-off MXFP8 and the BF16 layer; the
+    MXFP8 overlap calls ran; no CuTeDSL kernel is compiled at execution. With
+    quant_before_fsdp_ag the weights are quantized on their FSDP shards and gathered as MXFP8
+    (expert dimension sharded over (ep, fsdp) only)."""
+    if quant_before_fsdp_ag and layout["name"] != "fsdp2_ep2_expert":
+        pytest.skip("quantize-before-gather needs the expert dimension sharded over (ep, fsdp)")
+    global layout_mr_placeholder  # pylint: disable=global-statement
+    layout_mr_placeholder = layout["mr"]
+    with _ctx(layout):
+        x = _make_x(layout, 21)
+        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(22), x.shape, DTYPE), x.sharding)
+        off_block = _mxfp8_block(False, quant_before_fsdp_ag=quant_before_fsdp_ag)
+        on_block = _mxfp8_block(True, quant_before_fsdp_ag=quant_before_fsdp_ag)
+        # init traces and runs the forward: the first trace compiles this config's kernels.
+        before = _COMPILE_COUNTER["calls"]
+        abstract = jax.eval_shape(on_block.init, jax.random.PRNGKey(23), x)
+        shardings = nn.logical_to_mesh_sharding(
+            nn.get_partition_spec(abstract), layout["mesh"], layout["rules"]
+        )
+        variables = nn.unbox(
+            jax.jit(on_block.init, out_shardings=shardings)(jax.random.PRNGKey(23), x)
+        )
+
+        def run(block):
+            def loss(v, x):
+                out = block.apply(v, x)[0]
+                return jnp.sum(out.astype(jnp.float32) * dy.astype(jnp.float32)), out
+
+            fn = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))
+            (_, out), (gv, gx) = fn(variables, x)
+            return fn, out, gv["params"], gx
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*EP overlap skipped.*")
+            compiled = (
+                jax.jit(
+                    jax.value_and_grad(
+                        lambda v, x: jnp.sum(on_block.apply(v, x)[0].astype(jnp.float32)),
+                        argnums=(0, 1),
+                    )
+                )
+                .lower(variables, x)
+                .compile()
+            )
+            after_first = _COMPILE_COUNTER["calls"]
+            jax.block_until_ready(compiled(variables, x))
+            on_fn, out, gp, gx = run(on_block)
+            jax.block_until_ready(on_fn(variables, x))
+            jax.block_until_ready(on_fn(variables, x))
+            after_more = _COMPILE_COUNTER["calls"]
+        if jax.process_index() == 0:
+            print(
+                f"[mxfp8 {layout['name']} qbfag={quant_before_fsdp_ag}] CuTeDSL entries: init +"
+                f" fwd/bwd trace and compile {after_first - before}, 4 executions after that"
+                f" {after_more - after_first}",
+                flush=True,
+            )
+        assert after_more == after_first, "a CuTeDSL kernel was compiled at execution"
+        _, ref_out, ref_gp, ref_gx = run(off_block)
+        bf16_block = on_block.clone(quantization_recipe=None, quant_before_fsdp_ag=False)
+        _, b_out, b_gp, b_gx = run(bf16_block)
+        hlo = on_fn.lower(variables, x).as_text()
+        for target in OVERLAP_TARGETS:
+            mx = target.replace("_ffi", "_mxfp8_ffi")
+            assert mx in hlo, f"{mx} missing: the MXFP8 overlap path did not run"
+
+    def errs_of(o, g, gx_, r_out, r_gp, r_gx):
+        return {
+            "out": _rel_err(o, r_out),
+            "x": _rel_err(gx_, r_gx),
+            "wi": _rel_err(g["wi"], r_gp["wi"]),
+            "wo": _rel_err(g["wo"], r_gp["wo"]),
+            "gate_kernel": _rel_err(g["gate_kernel"], r_gp["gate_kernel"]),
+        }
+
+    on_vs_off = errs_of(out, gp, gx, ref_out, ref_gp, ref_gx)
+    on_vs_bf16 = errs_of(out, gp, gx, b_out, b_gp, b_gx)
+    off_vs_bf16 = errs_of(ref_out, ref_gp, ref_gx, b_out, b_gp, b_gx)
+    if jax.process_index() == 0:
+        tag = f"[mxfp8 {layout['name']} qbfag={quant_before_fsdp_ag}]"
+        print(f"{tag} on vs off {on_vs_off}", flush=True)
+        print(f"{tag} on vs bf16 {on_vs_bf16}", flush=True)
+        print(f"{tag} off vs bf16 {off_vs_bf16}", flush=True)
+    for k in on_vs_off:
+        # The overlap's MXFP8 error against the BF16 layer must be of the order of the flag-off
+        # MXFP8 path's own error, and the two MXFP8 paths must agree within MXFP8_TOL.
+        assert on_vs_bf16[k] <= 1.5 * off_vs_bf16[k] + 1e-2, (k, on_vs_bf16[k], off_vs_bf16[k])
+        assert on_vs_off[k] <= MXFP8_TOL[k], (k, on_vs_off[k])

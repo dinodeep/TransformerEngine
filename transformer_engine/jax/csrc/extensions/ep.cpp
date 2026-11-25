@@ -789,15 +789,17 @@ size_t EpOverlapWorkspaceSize(size_t hidden_dim, size_t ffn_dim, size_t num_loca
 }
 
 void EpOverlapCompile(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
-                      size_t recv_capacity, bool with_weight_grad, bool fp32_weight_grad, int top_k,
-                      size_t dispatch_output_per_expert_alignment, int topk_idx_dtype) {
+                      size_t recv_capacity, bool with_weight_grad, bool fp32_weight_grad,
+                      bool mxfp8, int top_k, size_t dispatch_output_per_expert_alignment,
+                      int topk_idx_dtype) {
   NVTEEpLayerConfig layer_cfg{
       .struct_size = sizeof(NVTEEpLayerConfig),
       .top_k = top_k,
       .dispatch_output_per_expert_alignment = dispatch_output_per_expert_alignment,
       .topk_idx_dtype = static_cast<NVTEDType>(topk_idx_dtype)};
   nvte_ep_overlap_compile(hidden_dim, ffn_dim, num_local_experts, recv_capacity,
-                          with_weight_grad ? 1 : 0, fp32_weight_grad ? 1 : 0, &layer_cfg);
+                          with_weight_grad ? 1 : 0, fp32_weight_grad ? 1 : 0, mxfp8 ? 1 : 0,
+                          &layer_cfg);
 }
 
 // Dispatch overlapped with FC1 + SwiGLU (act_out = silu(gate) * up * prob).
@@ -1002,6 +1004,288 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(EpDispatchGemmBwdHandler, EpDispatchGemmBwdFFI,
                                   .Ret<Buffer_Type>()  // grad_tokens [T, H]
                                   .Ret<Buffer_Type>()  // grad_topk_weights [T, K] f32
                                   .Ret<Buffer_Type>()  // weight_grad [E, 2F, H]
+                                  .Ret<Buffer_Type>()  // workspace
+                                  .Attrs<EpConfig>(),
+                              FFI_CudaGraph_Traits);
+
+// ── EP/GEMM overlap, MXFP8 ──────────────────────────────────────────────────
+//
+// MXFP8 variants of the four overlap calls (E4M3 data, E8M0 scales per 32 elements). Operand forms
+// follow ep_gemm.h: tokens, received rows and dY carry compact rowwise scales [rows, cols / 32];
+// weights and GEMM inputs/outputs carry GEMM-swizzled scales (flat, rows * cols / 32); the backward
+// reads both weights columnwise. Scale buffers are passed flat; only their element count matters.
+
+namespace {
+
+// MXFP8 tensor with rowwise and/or columnwise data (null: absent). Data shapes are 2D [rows, cols]
+// (3D for weights), scales flat.
+TensorWrapper MakeMxfp8(void* row, void* row_scale, void* col, void* col_scale,
+                        const std::vector<size_t>& shape, bool swizzled, bool compact_2d_scales) {
+  TensorWrapper t(NVTE_MXFP8_1D_SCALING);
+  size_t rows = 1;
+  for (size_t i = 0; i + 1 < shape.size(); ++i) rows *= shape[i];
+  const size_t cols = shape.back();
+  const std::vector<size_t> scale_shape = compact_2d_scales ? std::vector<size_t>{rows, cols / 32}
+                                                            : std::vector<size_t>{rows * cols / 32};
+  if (row != nullptr) {
+    t.set_rowwise_data(row, DType::kFloat8E4M3, shape);
+    t.set_rowwise_scale_inv(row_scale, DType::kFloat8E8M0, scale_shape);
+  }
+  if (col != nullptr) {
+    t.set_columnwise_data(col, DType::kFloat8E4M3, shape);
+    t.set_columnwise_scale_inv(col_scale, DType::kFloat8E8M0,
+                               std::vector<size_t>{rows * cols / 32});
+  }
+  t.set_with_gemm_swizzled_scales(swizzled);
+  return t;
+}
+
+TensorWrapper WrapF32(void* p, size_t n) {
+  return TensorWrapper(p, std::vector<size_t>{n}, DType::kFloat32);
+}
+TensorWrapper WrapI32(void* p, size_t n) {
+  return TensorWrapper(p, std::vector<size_t>{n}, DType::kInt32);
+}
+
+}  // namespace
+
+Error_Type EpDispatchGemmFwdMxfp8FFI(
+    cudaStream_t stream, EpInstanceState* ep_state, Buffer_Type topk_idx, Buffer_Type tokens,
+    Buffer_Type tokens_scale, Buffer_Type topk_weights, Buffer_Type weight,
+    Buffer_Type weight_scale, Result_Type recv_tokens, Result_Type recv_scale,
+    Result_Type recv_topk_weights, Result_Type gemm_out, Result_Type act_out, Result_Type act_scale,
+    Result_Type recv_tokens_per_expert, Result_Type expert_token_offsets, Result_Type handle_mem,
+    Result_Type workspace, EpConfig config) {
+  (void)ep_state;
+  auto layer_cfg = MakeLayerCfg(config);
+  return ffi_guard("EP dispatch_gemm_fwd (MXFP8) failed: ", [&] {
+    auto topk_idx_ = WrapArg(topk_idx);
+    auto tokens_ = MakeMxfp8(tokens.untyped_data(), tokens_scale.untyped_data(), nullptr, nullptr,
+                             Dims2D(DimsOf(tokens)), false, true);
+    auto topk_weights_ = WrapArg(topk_weights);
+    auto weight_ = MakeMxfp8(weight.untyped_data(), weight_scale.untyped_data(), nullptr, nullptr,
+                             DimsOf(weight), true, false);
+    auto recv_tokens_ = MakeMxfp8(recv_tokens->untyped_data(), recv_scale->untyped_data(), nullptr,
+                                  nullptr, Dims2D(DimsOf(*recv_tokens)), false, true);
+    auto recv_w_ = WrapF32(recv_topk_weights->untyped_data(), recv_topk_weights->element_count());
+    auto gemm_out_ = WrapRet(gemm_out);
+    auto act_out_ = MakeMxfp8(act_out->untyped_data(), act_scale->untyped_data(), nullptr, nullptr,
+                              Dims2D(DimsOf(*act_out)), true, false);
+    auto counts_ =
+        WrapI32(recv_tokens_per_expert->untyped_data(), recv_tokens_per_expert->element_count());
+    auto offsets_ =
+        WrapOffsets(expert_token_offsets->untyped_data(), expert_token_offsets->element_count());
+    auto handle_mem_ = WrapBytes(handle_mem->untyped_data(), handle_mem->size_bytes());
+    auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
+    nvte_ep_dispatch_gemm_fwd(
+        handle_mem_.data(), topk_idx_.data(), tokens_.data(), NVTECommWindow{nullptr, 0},
+        topk_weights_.data(), weight_.data(), recv_tokens_.data(), recv_w_.data(), gemm_out_.data(),
+        act_out_.data(), counts_.data(), offsets_.data(), nullptr, ws_.data(), &layer_cfg, stream);
+  });
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(EpDispatchGemmFwdMxfp8Handler, EpDispatchGemmFwdMxfp8FFI,
+                              FFI::Bind()
+                                  .Ctx<FFI_Stream_Type>()
+                                  .Ctx<::xla::ffi::State<EpInstanceState>>()
+                                  .Arg<Buffer_Type>()  // topk_idx [T, K]
+                                  .Arg<Buffer_Type>()  // tokens [T, H] E4M3
+                                  .Arg<Buffer_Type>()  // tokens_scale [T, H/32] compact
+                                  .Arg<Buffer_Type>()  // topk_weights [T, K] f32
+                                  .Arg<Buffer_Type>()  // weight [E, 2F, H] E4M3
+                                  .Arg<Buffer_Type>()  // weight_scale swizzled
+                                  .Ret<Buffer_Type>()  // recv_tokens [R, H] E4M3
+                                  .Ret<Buffer_Type>()  // recv_scale [R, H/32] compact
+                                  .Ret<Buffer_Type>()  // recv_topk_weights [R] f32
+                                  .Ret<Buffer_Type>()  // gemm_out [R, 2F] bf16
+                                  .Ret<Buffer_Type>()  // act_out [R, F] E4M3
+                                  .Ret<Buffer_Type>()  // act_scale swizzled
+                                  .Ret<Buffer_Type>()  // recv_tokens_per_expert [E]
+                                  .Ret<Buffer_Type>()  // expert_token_offsets [E + 4]
+                                  .Ret<Buffer_Type>()  // handle_mem
+                                  .Ret<Buffer_Type>()  // workspace
+                                  .Attrs<EpConfig>(),
+                              FFI_CudaGraph_Traits);
+
+Error_Type EpCombineGemmFwdMxfp8FFI(cudaStream_t stream, EpInstanceState* ep_state,
+                                    Buffer_Type handle_mem, Buffer_Type act_out,
+                                    Buffer_Type act_scale, Buffer_Type recv_topk_weights,
+                                    Buffer_Type expert_token_offsets, Buffer_Type weight,
+                                    Buffer_Type weight_scale, Result_Type expert_out,
+                                    Result_Type result, Result_Type workspace, EpConfig config) {
+  (void)ep_state;
+  auto layer_cfg = MakeLayerCfg(config);
+  return ffi_guard("EP combine_gemm_fwd (MXFP8) failed: ", [&] {
+    auto handle_mem_ = WrapBytes(handle_mem.untyped_data(), handle_mem.size_bytes());
+    auto act_out_ = MakeMxfp8(act_out.untyped_data(), act_scale.untyped_data(), nullptr, nullptr,
+                              Dims2D(DimsOf(act_out)), true, false);
+    auto recv_w_ = WrapF32(recv_topk_weights.untyped_data(), recv_topk_weights.element_count());
+    auto offsets_ =
+        WrapOffsets(expert_token_offsets.untyped_data(), expert_token_offsets.element_count());
+    auto weight_ = MakeMxfp8(weight.untyped_data(), weight_scale.untyped_data(), nullptr, nullptr,
+                             DimsOf(weight), true, false);
+    auto expert_out_ = WrapRet(expert_out);
+    auto result_ = WrapRet(result);
+    auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
+    nvte_ep_combine_gemm_fwd(handle_mem_.data(), act_out_.data(), recv_w_.data(), offsets_.data(),
+                             weight_.data(), expert_out_.data(), result_.data(), ws_.data(),
+                             &layer_cfg, stream);
+  });
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(EpCombineGemmFwdMxfp8Handler, EpCombineGemmFwdMxfp8FFI,
+                              FFI::Bind()
+                                  .Ctx<FFI_Stream_Type>()
+                                  .Ctx<::xla::ffi::State<EpInstanceState>>()
+                                  .Arg<Buffer_Type>()  // handle_mem
+                                  .Arg<Buffer_Type>()  // act_out [R, F] E4M3
+                                  .Arg<Buffer_Type>()  // act_scale swizzled
+                                  .Arg<Buffer_Type>()  // recv_topk_weights [R] f32
+                                  .Arg<Buffer_Type>()  // expert_token_offsets [E + 4]
+                                  .Arg<Buffer_Type>()  // weight [E, H, F] E4M3
+                                  .Arg<Buffer_Type>()  // weight_scale swizzled
+                                  .Ret<Buffer_Type>()  // expert_out [R, H] bf16
+                                  .Ret<Buffer_Type>()  // result [T, H] bf16
+                                  .Ret<Buffer_Type>()  // workspace
+                                  .Attrs<EpConfig>(),
+                              FFI_CudaGraph_Traits);
+
+Error_Type EpCombineGemmBwdMxfp8FFI(
+    cudaStream_t stream, EpInstanceState* ep_state, Buffer_Type handle_mem, Buffer_Type grad_result,
+    Buffer_Type grad_result_scale, Buffer_Type gemm_out, Buffer_Type recv_topk_weights,
+    Buffer_Type recv_tokens_per_expert, Buffer_Type weight_col, Buffer_Type weight_col_scale,
+    Result_Type grad_expert_out, Result_Type grad_expert_out_scale, Result_Type grad_expert_out_col,
+    Result_Type grad_expert_out_col_scale, Result_Type grad_gemm_out,
+    Result_Type grad_gemm_out_scale, Result_Type grad_gemm_out_col,
+    Result_Type grad_gemm_out_col_scale, Result_Type grad_recv_topk_weights, Result_Type act_col,
+    Result_Type act_col_scale, Result_Type weight_grad, Result_Type workspace, EpConfig config) {
+  (void)ep_state;
+  auto layer_cfg = MakeLayerCfg(config);
+  return ffi_guard("EP combine_gemm_bwd (MXFP8) failed: ", [&] {
+    auto handle_mem_ = WrapBytes(handle_mem.untyped_data(), handle_mem.size_bytes());
+    auto grad_result_ = MakeMxfp8(grad_result.untyped_data(), grad_result_scale.untyped_data(),
+                                  nullptr, nullptr, Dims2D(DimsOf(grad_result)), false, true);
+    auto gemm_out_ = WrapArg(gemm_out);
+    auto recv_w_ = WrapF32(recv_topk_weights.untyped_data(), recv_topk_weights.element_count());
+    auto counts_ =
+        WrapI32(recv_tokens_per_expert.untyped_data(), recv_tokens_per_expert.element_count());
+    auto weight_ = MakeMxfp8(nullptr, nullptr, weight_col.untyped_data(),
+                             weight_col_scale.untyped_data(), DimsOf(weight_col), true, false);
+    const auto geo_shape = Dims2D(DimsOf(*grad_expert_out));
+    auto grad_expert_out_ =
+        MakeMxfp8(grad_expert_out->untyped_data(), grad_expert_out_scale->untyped_data(),
+                  grad_expert_out_col->untyped_data(), grad_expert_out_col_scale->untyped_data(),
+                  geo_shape, false, true);
+    auto grad_gemm_out_ =
+        MakeMxfp8(grad_gemm_out->untyped_data(), grad_gemm_out_scale->untyped_data(),
+                  grad_gemm_out_col->untyped_data(), grad_gemm_out_col_scale->untyped_data(),
+                  Dims2D(DimsOf(*grad_gemm_out)), true, false);
+    auto grad_recv_w_ =
+        WrapF32(grad_recv_topk_weights->untyped_data(), grad_recv_topk_weights->element_count());
+    // act_out: columnwise prob * silu(gate) * up, written by this call and read by the FC2 wgrad.
+    auto act_ = MakeMxfp8(nullptr, nullptr, act_col->untyped_data(), act_col_scale->untyped_data(),
+                          Dims2D(DimsOf(*act_col)), true, false);
+    auto wgrad_input_ =
+        MakeMxfp8(nullptr, nullptr, act_col->untyped_data(), act_col_scale->untyped_data(),
+                  Dims2D(DimsOf(*act_col)), true, false);
+    auto weight_grad_ = WrapRet(weight_grad, false);
+    auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
+    nvte_ep_combine_gemm_bwd(handle_mem_.data(), grad_result_.data(), NVTECommWindow{nullptr, 0},
+                             gemm_out_.data(), recv_w_.data(), counts_.data(), weight_.data(),
+                             wgrad_input_.data(), grad_expert_out_.data(), grad_gemm_out_.data(),
+                             grad_recv_w_.data(), act_.data(), weight_grad_.data(), 0, ws_.data(),
+                             &layer_cfg, stream);
+  });
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(EpCombineGemmBwdMxfp8Handler, EpCombineGemmBwdMxfp8FFI,
+                              FFI::Bind()
+                                  .Ctx<FFI_Stream_Type>()
+                                  .Ctx<::xla::ffi::State<EpInstanceState>>()
+                                  .Arg<Buffer_Type>()  // handle_mem
+                                  .Arg<Buffer_Type>()  // grad_result [T, H] E4M3
+                                  .Arg<Buffer_Type>()  // grad_result_scale [T, H/32] compact
+                                  .Arg<Buffer_Type>()  // gemm_out [R, 2F] bf16
+                                  .Arg<Buffer_Type>()  // recv_topk_weights [R] f32
+                                  .Arg<Buffer_Type>()  // recv_tokens_per_expert [E]
+                                  .Arg<Buffer_Type>()  // weight columnwise [E, H, F] E4M3
+                                  .Arg<Buffer_Type>()  // weight columnwise scale swizzled
+                                  .Ret<Buffer_Type>()  // grad_expert_out [R, H] E4M3
+                                  .Ret<Buffer_Type>()  // its compact scales
+                                  .Ret<Buffer_Type>()  // grad_expert_out columnwise
+                                  .Ret<Buffer_Type>()  // its swizzled scales
+                                  .Ret<Buffer_Type>()  // grad_gemm_out [R, 2F] E4M3
+                                  .Ret<Buffer_Type>()  // its swizzled scales
+                                  .Ret<Buffer_Type>()  // grad_gemm_out columnwise
+                                  .Ret<Buffer_Type>()  // its swizzled scales
+                                  .Ret<Buffer_Type>()  // grad_recv_topk_weights [R] f32
+                                  .Ret<Buffer_Type>()  // act columnwise [R, F] E4M3
+                                  .Ret<Buffer_Type>()  // its swizzled scales
+                                  .Ret<Buffer_Type>()  // weight_grad [E, H, F]
+                                  .Ret<Buffer_Type>()  // workspace
+                                  .Attrs<EpConfig>(),
+                              FFI_CudaGraph_Traits);
+
+Error_Type EpDispatchGemmBwdMxfp8FFI(
+    cudaStream_t stream, EpInstanceState* ep_state, Buffer_Type handle_mem,
+    Buffer_Type grad_gemm_out, Buffer_Type grad_gemm_out_scale, Buffer_Type grad_gemm_out_col,
+    Buffer_Type grad_gemm_out_col_scale, Buffer_Type grad_recv_topk_weights,
+    Buffer_Type recv_tokens_per_expert, Buffer_Type weight_col, Buffer_Type weight_col_scale,
+    Buffer_Type recv_tokens, Buffer_Type recv_scale, Result_Type grad_recv_tokens,
+    Result_Type grad_tokens, Result_Type grad_topk_weights, Result_Type weight_grad,
+    Result_Type recv_col, Result_Type recv_col_scale, Result_Type workspace, EpConfig config) {
+  (void)ep_state;
+  auto layer_cfg = MakeLayerCfg(config);
+  return ffi_guard("EP dispatch_gemm_bwd (MXFP8) failed: ", [&] {
+    auto handle_mem_ = WrapBytes(handle_mem.untyped_data(), handle_mem.size_bytes());
+    auto grad_gemm_out_ =
+        MakeMxfp8(grad_gemm_out.untyped_data(), grad_gemm_out_scale.untyped_data(),
+                  grad_gemm_out_col.untyped_data(), grad_gemm_out_col_scale.untyped_data(),
+                  Dims2D(DimsOf(grad_gemm_out)), true, false);
+    auto grad_recv_w_ =
+        WrapF32(grad_recv_topk_weights.untyped_data(), grad_recv_topk_weights.element_count());
+    auto counts_ =
+        WrapI32(recv_tokens_per_expert.untyped_data(), recv_tokens_per_expert.element_count());
+    auto weight_ = MakeMxfp8(nullptr, nullptr, weight_col.untyped_data(),
+                             weight_col_scale.untyped_data(), DimsOf(weight_col), true, false);
+    // wgrad_input: the forward's rowwise recv_tokens (compact scales); the call writes its
+    // columnwise copy into recv_col. The wrapper carries the swizzled flag (columnwise reads).
+    auto wgrad_input_ =
+        MakeMxfp8(recv_tokens.untyped_data(), recv_scale.untyped_data(), recv_col->untyped_data(),
+                  recv_col_scale->untyped_data(), Dims2D(DimsOf(recv_tokens)), true, true);
+    auto grad_recv_tokens_ = WrapRet(grad_recv_tokens);
+    auto grad_tokens_ = WrapRet(grad_tokens);
+    auto grad_topk_ = WrapRet(grad_topk_weights);
+    auto weight_grad_ = WrapRet(weight_grad, false);
+    auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
+    nvte_ep_dispatch_gemm_bwd(handle_mem_.data(), grad_gemm_out_.data(), grad_recv_w_.data(),
+                              counts_.data(), weight_.data(), wgrad_input_.data(),
+                              grad_recv_tokens_.data(), grad_tokens_.data(), grad_topk_.data(),
+                              weight_grad_.data(), 0, ws_.data(), &layer_cfg, stream);
+  });
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(EpDispatchGemmBwdMxfp8Handler, EpDispatchGemmBwdMxfp8FFI,
+                              FFI::Bind()
+                                  .Ctx<FFI_Stream_Type>()
+                                  .Ctx<::xla::ffi::State<EpInstanceState>>()
+                                  .Arg<Buffer_Type>()  // handle_mem
+                                  .Arg<Buffer_Type>()  // grad_gemm_out [R, 2F] E4M3
+                                  .Arg<Buffer_Type>()  // its swizzled scales
+                                  .Arg<Buffer_Type>()  // grad_gemm_out columnwise
+                                  .Arg<Buffer_Type>()  // its swizzled scales
+                                  .Arg<Buffer_Type>()  // grad_recv_topk_weights [R] f32
+                                  .Arg<Buffer_Type>()  // recv_tokens_per_expert [E]
+                                  .Arg<Buffer_Type>()  // weight columnwise [E, 2F, H] E4M3
+                                  .Arg<Buffer_Type>()  // its swizzled scales
+                                  .Arg<Buffer_Type>()  // recv_tokens [R, H] E4M3 (forward)
+                                  .Arg<Buffer_Type>()  // recv_scale [R, H/32] compact
+                                  .Ret<Buffer_Type>()  // grad_recv_tokens [R, H] bf16
+                                  .Ret<Buffer_Type>()  // grad_tokens [T, H] bf16
+                                  .Ret<Buffer_Type>()  // grad_topk_weights [T, K] f32
+                                  .Ret<Buffer_Type>()  // weight_grad [E, 2F, H]
+                                  .Ret<Buffer_Type>()  // recv_tokens columnwise [R, H] E4M3
+                                  .Ret<Buffer_Type>()  // its swizzled scales
                                   .Ret<Buffer_Type>()  // workspace
                                   .Attrs<EpConfig>(),
                               FFI_CudaGraph_Traits);

@@ -153,6 +153,18 @@ pybind11::dict Registrations() {
   dict["te_ep_dispatch_gemm_bwd_ffi"] =
       pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
                      pybind11::arg("execute") = EncapsulateFFI(EpDispatchGemmBwdHandler));
+  dict["te_ep_dispatch_gemm_fwd_mxfp8_ffi"] =
+      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
+                     pybind11::arg("execute") = EncapsulateFFI(EpDispatchGemmFwdMxfp8Handler));
+  dict["te_ep_combine_gemm_fwd_mxfp8_ffi"] =
+      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
+                     pybind11::arg("execute") = EncapsulateFFI(EpCombineGemmFwdMxfp8Handler));
+  dict["te_ep_combine_gemm_bwd_mxfp8_ffi"] =
+      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
+                     pybind11::arg("execute") = EncapsulateFFI(EpCombineGemmBwdMxfp8Handler));
+  dict["te_ep_dispatch_gemm_bwd_mxfp8_ffi"] =
+      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
+                     pybind11::arg("execute") = EncapsulateFFI(EpDispatchGemmBwdMxfp8Handler));
 
   // Borrowed-comm bootstrap: a one-shot op requests the collective clique
   // (generic prepare) and initializes EPBackend from the borrowed comm (EP
@@ -215,7 +227,7 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
   m.def("ep_overlap_compile", &EpOverlapCompile, pybind11::arg("hidden_dim"),
         pybind11::arg("ffn_dim"), pybind11::arg("num_local_experts"),
         pybind11::arg("recv_capacity"), pybind11::arg("with_weight_grad"),
-        pybind11::arg("fp32_weight_grad"), pybind11::arg("top_k"),
+        pybind11::arg("fp32_weight_grad"), pybind11::arg("mxfp8"), pybind11::arg("top_k"),
         pybind11::arg("dispatch_output_per_expert_alignment"), pybind11::arg("topk_idx_dtype"),
         pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("get_ep_instance_state_type_id", &GetEpInstanceStateTypeIdCapsule);

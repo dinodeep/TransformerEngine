@@ -1615,6 +1615,12 @@ def _moe_fwd_rule(
                 recv_pr=recv_pr,
                 native_layout=cudnn_native_weight_layout,
                 fc2_native_layout=use_ep_overlap == _EP_OVERLAP_FC2_NATIVE,
+                mxfp8=_ep_overlap_recipe(quantizer_sets, dispatch_quantizer)[0],
+                quant_gather_axis=(
+                    _ep_overlap_quant_gather_axis(mesh_resource, wi_kernel_axes, wo_kernel_axes)
+                    if quant_before_fsdp_ag
+                    else None
+                ),
             )
             output = with_sharding_constraint_by_logical_axes(output, input_axes)
             ctx = _Ctx(
@@ -1649,6 +1655,7 @@ def _moe_fwd_rule(
                 "recv_pr": recv_pr,
                 "cudnn_native_weight_layout": cudnn_native_weight_layout,
                 "fc2_native_layout": use_ep_overlap == _EP_OVERLAP_FC2_NATIVE,
+                "mxfp8": _ep_overlap_recipe(quantizer_sets, dispatch_quantizer)[0],
             }
             return (output, aux_loss, total_recv_tokens, expert_counts), (ctx, static)
 
@@ -1917,6 +1924,7 @@ def _moe_bwd_rule(
                 cfg=ctx.cfg,
                 native_layout=static["cudnn_native_weight_layout"],
                 fc2_native_layout=static["fc2_native_layout"],
+                mxfp8=static["mxfp8"],
             )
             d_wi_0_bias = d_wi_1_bias = d_wo_bias = None
         else:
@@ -2197,6 +2205,8 @@ def _ep_overlap_rejection_reasons(
     recv_capacity_per_rank,
     use_cudnn_fusion,
     checkpoint_names,
+    wi_kernel_axes=(),
+    wo_kernel_axes=(),
 ) -> list:
     """Reasons this call cannot use the EP/GEMM overlap path (empty when it can)."""
     from transformer_engine_jax import get_device_compute_capability
@@ -2226,22 +2236,30 @@ def _ep_overlap_rejection_reasons(
         reasons.append("biases are not supported")
     if str(activation_type).lower() != "silu":
         reasons.append("needs activation_type='silu' (SwiGLU)")
-    if dispatch_quantizer is not None:
-        reasons.append("quantized (MXFP8) dispatch is not supported yet")
-    for qs in quantizer_sets:
-        if any(q is not None for q in (qs.x, qs.kernel, qs.dgrad)):
-            reasons.append("quantized grouped GEMMs (MXFP8) are not supported yet")
-            break
+    mxfp8, mxfp8_reasons = _ep_overlap_recipe(quantizer_sets, dispatch_quantizer)
+    reasons.extend(mxfp8_reasons)
     if quant_before_fsdp_ag:
-        reasons.append("quant_before_fsdp_ag is not supported")
+        if not mxfp8:
+            reasons.append("quant_before_fsdp_ag needs the MXFP8 recipe")
+        elif _ep_overlap_quant_gather_axis(mesh_resource, wi_kernel_axes, wo_kernel_axes) is None:
+            reasons.append(
+                "quant_before_fsdp_ag needs the expert dimension of wi and wo sharded over (ep,"
+                " fsdp) (e.g. logical rule exp -> (ep, fsdp)); hidden-dim FSDP is not supported"
+            )
     if any(n is not None for n in checkpoint_names):
         reasons.append("checkpoint names are not supported")
     hidden = x.shape[-1]
+    if mxfp8 and hidden % 512:
+        reasons.append(f"MXFP8 needs hidden_dim a multiple of 512, got {hidden}")
     if hidden % 256:
         reasons.append(f"hidden_dim must be a multiple of 256, got {hidden}")
     ffn = wo_ffn = None
     if wi.ndim == 3:
         ffn = (wi.shape[2] if wi.shape[1] == hidden else wi.shape[1]) // 2
+    if mxfp8 and (ffn is None or ffn % 256):
+        reasons.append(f"MXFP8 needs ffn_hidden_size a multiple of 256, got {ffn}")
+    if mxfp8 and not use_cudnn_fusion and _ALIGN_SIZE < 128:
+        reasons.append("MXFP8 needs an EP alignment of at least 128")
     if ffn is None or ffn % 64:
         reasons.append(f"ffn_hidden_size must be a multiple of 64, got {ffn}")
     del wo_ffn
@@ -2277,6 +2295,97 @@ def _ep_overlap_rejection_reasons(
     return reasons
 
 
+def _ep_overlap_quant_gather_axis(mesh_resource, wi_kernel_axes, wo_kernel_axes):
+    """The FSDP axis for quantize-before-gather when both expert weights shard their expert
+    dimension over (ep, fsdp) and nothing else, else None."""
+    fsdp = mesh_resource.fsdp_resource
+    if fsdp is None or not nn.get_logical_axis_rules():
+        return None
+    want = (mesh_resource.ep_resource, fsdp)
+    for axes in (wi_kernel_axes, wo_kernel_axes):
+        spec = tuple(nn.logical_to_mesh_axes(axes)) if axes else ()
+        if len(spec) != 3 or spec[1:] != (None, None):
+            return None
+        first = spec[0] if isinstance(spec[0], tuple) else (spec[0],)
+        if tuple(first) != want:
+            return None
+    return fsdp
+
+
+def _ep_overlap_recipe(quantizer_sets, dispatch_quantizer):
+    """(mxfp8, reasons): BF16 when no quantizer is set, MXFP8 when every grouped-GEMM quantizer
+    is MXFP8 E4M3 (the overlap path quantizes its operands itself, in the forms ep_gemm.h needs)."""
+    quantizers = [q for qs in quantizer_sets for q in (qs.x, qs.kernel, qs.dgrad)]
+    if all(q is None for q in quantizers) and dispatch_quantizer is None:
+        return False, []
+    reasons = []
+    for q in quantizers + ([dispatch_quantizer] if dispatch_quantizer is not None else []):
+        if q is None or q.scaling_mode != ScalingMode.MXFP8_1D_SCALING:
+            reasons.append("quantized overlap needs MXFP8 (MXFP8BlockScaling) for every operand")
+            break
+        if q.q_dtype != jnp.float8_e4m3fn:
+            reasons.append(f"MXFP8 overlap needs E4M3 operands, got {q.q_dtype}")
+            break
+    return True, reasons
+
+
+def _ep_overlap_mxfp8_rows(x):
+    """Rowwise MXFP8 with compact scales [rows, cols / 32] of a 2D tensor."""
+    q = QuantizerFactory.create(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        q_dtype=jnp.float8_e4m3fn,
+        q_layout=QuantizeLayout.ROWWISE,
+    )
+    t = tex.quantize(x, q)
+    rows, cols = x.shape
+    return t.data.reshape(rows, cols), t.scale_inv.reshape(-1)[: rows * cols // 32].reshape(
+        rows, cols // 32
+    )
+
+
+def _ep_overlap_mxfp8_weight_2x(w):
+    """Rowwise and columnwise grouped MXFP8 of [E, m, n] in one pass: (row data, row scales,
+    col data, col scales), data [E, m, n] E4M3, scales flat GEMM-swizzled E * m * n / 32."""
+    E, m, n = w.shape
+    q = QuantizerFactory.create(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        q_dtype=jnp.float8_e4m3fn,
+        q_layout=QuantizeLayout.ROWWISE_COLWISE,
+        n_groups=E,
+    )
+    t = tex.grouped_quantize(w, q, flatten_axis=-1)
+    count = E * m * n // 32
+    r, c = t.rowwise_tensor, t.colwise_tensor
+    return (
+        r.data.reshape(E, m, n),
+        r.scale_inv.reshape(-1)[:count],
+        c.data.reshape(E, m, n),
+        c.scale_inv.reshape(-1)[:count],
+    )
+
+
+def _ep_overlap_gather_experts(arrays, fsdp_axis):
+    """All-gather per-expert MXFP8 data [E_loc, m, n] and flat swizzled scales (whole experts,
+    contiguous per expert) along the expert axis over fsdp_axis (quantize-before-gather)."""
+    return tuple(jax.lax.all_gather(a, fsdp_axis, axis=0, tiled=True) for a in arrays)
+
+
+def _ep_overlap_mxfp8_weight(w, columnwise):
+    """Grouped MXFP8 of a per-expert weight [E, m, n] with GEMM-swizzled scales along n (rowwise)
+    or along m (columnwise): (E4M3 data [E, m, n], flat scales E * m * n / 32)."""
+    E, m, n = w.shape
+    q = QuantizerFactory.create(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        q_dtype=jnp.float8_e4m3fn,
+        q_layout=QuantizeLayout.COLWISE if columnwise else QuantizeLayout.ROWWISE,
+        n_groups=E,
+    )
+    t = tex.grouped_quantize(w, q, flatten_axis=-1)
+    if isinstance(t, ScaledTensor2x):
+        t = t.colwise_tensor if columnwise else t.rowwise_tensor
+    return t.data.reshape(E, m, n), t.scale_inv.reshape(-1)[: E * m * n // 32]
+
+
 def _ep_overlap_fc1_weight(wi, native_layout):
     """FC1 weights as the overlap GEMM reads them: [E, 2F, H], gate/up in 32-row blocks."""
     if native_layout:
@@ -2307,8 +2416,12 @@ def _ep_overlap_fwd(
     recv_pr,
     native_layout,
     fc2_native_layout=False,
+    mxfp8=False,
+    quant_gather_axis=None,
 ):
-    """Overlapped dispatch/FC1/SwiGLU/FC2/combine. Returns (output [B,S,H], total_recv_tokens,
+    """Overlapped dispatch/FC1/SwiGLU/FC2/combine. With MXFP8 and ``quant_gather_axis`` (the
+    FSDP axis, sharding the expert dimension together with EP), the weights enter as their local
+    shards, are quantized there and gathered as MXFP8 (quantize before the FSDP all-gather). Returns (output [B,S,H], total_recv_tokens,
     recv_topk_weights, handle_mem, residuals)."""
     from jax.experimental.shard_map import shard_map
 
@@ -2327,14 +2440,53 @@ def _ep_overlap_fwd(
         tokens = x_l.reshape(T, H)
         idx = idx_l.reshape(T, K).astype(jnp.int32)
         tw = w_l.reshape(T, K).astype(jnp.float32)
-        recv_tokens, recv_w, gemm_out, act_out, counts, offsets, handle_mem = (
-            tex_ep_overlap.ep_dispatch_gemm_fwd(
-                idx, tokens, tw, w1_l, recv_capacity=recv_pr, alignment=align
+        if mxfp8:
+            tok_q, tok_s = _ep_overlap_mxfp8_rows(tokens)
+            w1_q, w1_s, w1_c, w1_cs = _ep_overlap_mxfp8_weight_2x(w1_l)
+            w2_q, w2_s, w2_c, w2_cs = _ep_overlap_mxfp8_weight_2x(w2_l)
+            if quant_gather_axis is not None:
+                w1_q, w1_s, w1_c, w1_cs, w2_q, w2_s, w2_c, w2_cs = _ep_overlap_gather_experts(
+                    (w1_q, w1_s, w1_c, w1_cs, w2_q, w2_s, w2_c, w2_cs), quant_gather_axis
+                )
+            # The backward reads both weights columnwise: keep those as the weight residuals.
+            weight_res = (w1_c, w1_cs, w2_c, w2_cs)
+            (
+                recv_tokens,
+                recv_scale,
+                recv_w,
+                gemm_out,
+                act_q,
+                act_s,
+                counts,
+                offsets,
+                handle_mem,
+            ) = tex_ep_overlap.ep_dispatch_gemm_fwd_mxfp8(
+                idx, tok_q, tok_s, tw, w1_q, w1_s, recv_capacity=recv_pr, alignment=align
             )
-        )
-        out = tex_ep_overlap.ep_combine_gemm_fwd(
-            handle_mem, act_out, offsets, w2_l, num_tokens=T, top_k=K, alignment=align
-        )
+            out = tex_ep_overlap.ep_combine_gemm_fwd_mxfp8(
+                handle_mem,
+                act_q,
+                act_s,
+                recv_w,
+                offsets,
+                w2_q,
+                w2_s,
+                num_tokens=T,
+                top_k=K,
+                alignment=align,
+            ).astype(x_l.dtype)
+            # The MXFP8 backward recomputes the activation; keep the received rows' scales instead.
+            act_out = recv_scale
+        else:
+            recv_tokens, recv_w, gemm_out, act_out, counts, offsets, handle_mem = (
+                tex_ep_overlap.ep_dispatch_gemm_fwd(
+                    idx, tokens, tw, w1_l, recv_capacity=recv_pr, alignment=align
+                )
+            )
+            out = tex_ep_overlap.ep_combine_gemm_fwd(
+                handle_mem, act_out, offsets, w2_l, num_tokens=T, top_k=K, alignment=align
+            )
+            weight_res = (w1_l, w2_l)
         total = offsets[-1:]
         return (
             out.reshape(x_l.shape),
@@ -2342,14 +2494,19 @@ def _ep_overlap_fwd(
             recv_w,
             handle_mem,
             (recv_tokens, gemm_out, act_out, counts),
-            (w1_l, w2_l),
+            weight_res,
         )
 
+    eflat = P(ep_axis)
+    weight_res_specs = (kspec, eflat, kspec, eflat) if mxfp8 else (kspec, kspec)
+    w_in_spec = kspec
+    if quant_gather_axis is not None:
+        w_in_spec = P((ep_axis, quant_gather_axis), None, None)
     out, total, recv_w, handle_mem, res, gathered = shard_map(
         body,
         mesh=mesh,
-        in_specs=(tok, tok, tok, kspec, kspec),
-        out_specs=(tok, row, row, row, (row2, row2, row2, row), (kspec, kspec)),
+        in_specs=(tok, tok, tok, w_in_spec, w_in_spec),
+        out_specs=(tok, row, row, row, (row2, row2, row2, row), weight_res_specs),
         check_rep=False,
     )(x, topk_idx_3d, topk_w_3d, w1, w2)
     total = total.reshape(-1, 1)
@@ -2357,7 +2514,7 @@ def _ep_overlap_fwd(
     # (already gathered over the data axes), so an FSDP backward does not gather them again; with
     # NVTE_JAX_EP_OVERLAP_REGATHER=1 the stored (FSDP-sharded) parameters, gathered again in the
     # backward (less memory, one more all-gather per weight).
-    if os.environ.get("NVTE_JAX_EP_OVERLAP_REGATHER", "0") == "1":
+    if not mxfp8 and os.environ.get("NVTE_JAX_EP_OVERLAP_REGATHER", "0") == "1":
         gathered = (w1, w2)
     return out, total, recv_w, handle_mem, (*res, *gathered)
 
@@ -2375,11 +2532,13 @@ def _ep_overlap_bwd(
     cfg,
     native_layout,
     fc2_native_layout=False,
+    mxfp8=False,
+    wgrad_dtype=jnp.bfloat16,
 ):
     """Backward of :func:`_ep_overlap_fwd`. Returns (d_x, d_topk_w [B*S... ,K], d_wi, d_wo)."""
     from jax.experimental.shard_map import shard_map
 
-    recv_tokens, gemm_out, act_out, counts, w1, w2 = residuals
+    recv_tokens, gemm_out, act_out, counts, *weights = residuals
     H = d_output.shape[-1]
     K = cfg.top_k
     align = cfg.dispatch_output_per_expert_alignment
@@ -2388,15 +2547,59 @@ def _ep_overlap_bwd(
     row2 = P(batch_axes, None)
     kspec = P(ep_axis, None, None)
 
-    def body(dy_l, hm, rw, rt, go, ao, cnt, w1_l, w2_l):
+    def body(dy_l, hm, rw, rt, go, ao, cnt, *ws):
         T = dy_l.shape[0] * dy_l.shape[1]
         dy = dy_l.reshape(T, H)
-        grad_gemm_out, grad_recv_w, d_w2 = tex_ep_overlap.ep_combine_gemm_bwd(
-            hm, dy, go, rw, cnt, w2_l, ao, top_k=K, alignment=align
-        )
-        grad_tokens, grad_topk, d_w1 = tex_ep_overlap.ep_dispatch_gemm_bwd(
-            hm, grad_gemm_out, grad_recv_w, cnt, w1_l, rt, num_tokens=T, top_k=K, alignment=align
-        )
+        if mxfp8:
+            # ao holds the received rows' compact scales (see _ep_overlap_fwd).
+            dy_q, dy_s = _ep_overlap_mxfp8_rows(dy)
+            w1_c, w1_cs, w2_c, w2_cs = ws  # columnwise MXFP8 weights saved by the forward
+            ggo, ggo_s, ggo_c, ggo_cs, grad_recv_w, d_w2 = tex_ep_overlap.ep_combine_gemm_bwd_mxfp8(
+                hm,
+                dy_q,
+                dy_s,
+                go,
+                rw,
+                cnt,
+                w2_c,
+                w2_cs,
+                top_k=K,
+                alignment=align,
+                weight_grad_dtype=wgrad_dtype,
+            )
+            grad_tokens, grad_topk, d_w1 = tex_ep_overlap.ep_dispatch_gemm_bwd_mxfp8(
+                hm,
+                ggo,
+                ggo_s,
+                ggo_c,
+                ggo_cs,
+                grad_recv_w,
+                cnt,
+                w1_c,
+                w1_cs,
+                rt,
+                ao,
+                num_tokens=T,
+                top_k=K,
+                alignment=align,
+                weight_grad_dtype=wgrad_dtype,
+            )
+        else:
+            w1_l, w2_l = ws
+            grad_gemm_out, grad_recv_w, d_w2 = tex_ep_overlap.ep_combine_gemm_bwd(
+                hm, dy, go, rw, cnt, w2_l, ao, top_k=K, alignment=align
+            )
+            grad_tokens, grad_topk, d_w1 = tex_ep_overlap.ep_dispatch_gemm_bwd(
+                hm,
+                grad_gemm_out,
+                grad_recv_w,
+                cnt,
+                w1_l,
+                rt,
+                num_tokens=T,
+                top_k=K,
+                alignment=align,
+            )
         if dp_axes:
             d_w1 = jax.lax.psum(d_w1, axis_name=dp_axes)
             d_w2 = jax.lax.psum(d_w2, axis_name=dp_axes)
@@ -2405,10 +2608,11 @@ def _ep_overlap_bwd(
     d_x, d_topk_w, d_w1, d_w2 = shard_map(
         body,
         mesh=mesh,
-        in_specs=(tok, row, row, row2, row2, row2, row, kspec, kspec),
+        in_specs=(tok, row, row, row2, row2, row2, row)
+        + ((kspec, P(ep_axis), kspec, P(ep_axis)) if mxfp8 else (kspec, kspec)),
         out_specs=(tok, tok, kspec, kspec),
         check_rep=False,
-    )(d_output, handle_mem, recv_w, recv_tokens, gemm_out, act_out, counts, w1, w2)
+    )(d_output, handle_mem, recv_w, recv_tokens, gemm_out, act_out, counts, *weights)
     d_wi = _ep_overlap_fc1_weight_grad(d_w1, native_layout)
     d_wo = d_w2 if fc2_native_layout else d_w2.transpose(0, 2, 1)
     return d_x, d_topk_w, d_wi, d_wo
@@ -2718,6 +2922,8 @@ def moe(
                 quant_before_fsdp_ag=quant_before_fsdp_ag,
                 recv_capacity_per_rank=recv_capacity_per_rank,
                 use_cudnn_fusion=use_cudnn_fusion,
+                wi_kernel_axes=wi_kernel_axes,
+                wo_kernel_axes=wo_kernel_axes,
                 checkpoint_names=(
                     wi_0_checkpoint_name,
                     wi_1_checkpoint_name,

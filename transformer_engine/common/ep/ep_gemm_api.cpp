@@ -623,14 +623,19 @@ size_t nvte_ep_overlap_workspace_size(size_t hidden_dim, size_t ffn_dim, size_t 
 // cached kernels. Mirrors the BF16 branches of the four entry points below; keep them in sync.
 void nvte_ep_overlap_compile(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
                              size_t recv_capacity, int with_weight_grad, int fp32_weight_grad,
-                             const NVTEEpLayerConfig* layer_cfg) {
+                             int mxfp8, const NVTEEpLayerConfig* layer_cfg) {
   NVTE_API_CALL(nvte_ep_overlap_compile);
   using namespace transformer_engine;
   const size_t ne = num_local_experts;
   const size_t rows = recv_capacity;
-  const NVTEScalingMode mx = NVTE_DELAYED_TENSOR_SCALING;
+  const bool is_mx = mxfp8 != 0;
+  const NVTEScalingMode mx = is_mx ? NVTE_MXFP8_1D_SCALING : NVTE_DELAYED_TENSOR_SCALING;
   const bool wg = with_weight_grad != 0;
   ep::WorkspaceLayout layout;
+  if (is_mx) {
+    check_mxfp8_dims(hidden_dim, ffn_dim,
+                     ep::normalize_layer_config(layer_cfg).dispatch_output_per_expert_alignment);
+  }
   // The weight-gradient launches of a backward call (see make_wgrad and launch_wgrad).
   const auto compile_wgrad = [&](const EpGemmContext& ctx, size_t m, size_t n,
                                  std::initializer_list<std::tuple<int, bool, size_t>> launches) {
@@ -641,6 +646,13 @@ void nvte_ep_overlap_compile(size_t hidden_dim, size_t ffn_dim, size_t num_local
                                  routed_rows};
     NVTE_CHECK(base.workspace_layout().has_value(),
                "cannot query the weight-gradient workspace layout");
+    // MXFP8: a descriptors-only launch first when the weight gradient reads per-expert descriptors.
+    if (base.is_mxfp8() && base.reads_descriptors()) {
+      ep::EpWgradConfig config = base;
+      config.num_clusters = 1;
+      config.descriptors_only = true;
+      get_gemm(config, &layout);
+    }
     for (const auto& [clusters, wait_primary_at_start, ready_slot_rows] : launches) {
       if (clusters <= 0) continue;
       ep::EpWgradConfig config = base;
@@ -666,14 +678,25 @@ void nvte_ep_overlap_compile(size_t hidden_dim, size_t ffn_dim, size_t num_local
     const EpGemmContext ctx = make_context(layer_cfg, &NVTEEpGroupConfig::combine_fwd_num_sms);
     get_gemm(combine_fwd_config(ctx, rows, ffn_dim, hidden_dim, ne, mx), &layout);
   }
-  // nvte_ep_combine_gemm_bwd (BF16): FC2 dgrad + dSwiGLU; the FC2 weight gradient [hidden, ffn],
-  // tail then base, both behind the dispatch flags.
+  // nvte_ep_combine_gemm_bwd: FC2 dgrad + dSwiGLU; the FC2 weight gradient [hidden, ffn]. BF16:
+  // tail then base, both behind the dispatch flags. MXFP8: the requant of the columnwise
+  // grad_expert_out, a dGLU tail, then the weight gradient's base and tail.
   {
     const EpGemmContext ctx = make_context(layer_cfg, &NVTEEpGroupConfig::dispatch_bwd_num_sms);
-    get_gemm(ep::EpDispatchGemmConfig{rows, hidden_dim, ffn_dim, ne, ctx.num_clusters, true, mx,
-                                      ctx.alignment()},
-             &layout);
-    if (wg) {
+    const ep::EpDispatchGemmConfig config{rows, hidden_dim, ffn_dim,        ne, ctx.num_clusters,
+                                          true, mx,         ctx.alignment()};
+    get_gemm(config, &layout);
+    if (is_mx) {
+      const ep::EpRequantConfig requant{rows, hidden_dim, ne, ctx.ready_slot_rows()};
+      NVTE_CHECK(requant.get_kernel().has_value(), "the EP MXFP8 requant is not available");
+      const int tail_clusters = ctx.all_clusters - ctx.num_clusters;
+      if (tail_clusters > 0) get_tail_gemm(config, tail_clusters, layout, "the dGLU tail");
+      if (wg) {
+        compile_wgrad(
+            ctx, hidden_dim, ffn_dim,
+            {{ctx.num_clusters, true, 0}, {ctx.all_clusters - ctx.num_clusters, false, 0}});
+      }
+    } else if (wg) {
       compile_wgrad(ctx, hidden_dim, ffn_dim,
                     {{ctx.all_clusters - ctx.num_clusters, false, ctx.ready_slot_rows()},
                      {ctx.num_clusters, false, ctx.ready_slot_rows()}});
@@ -689,6 +712,10 @@ void nvte_ep_overlap_compile(size_t hidden_dim, size_t ffn_dim, size_t num_local
                                      wg ? ctx.all_clusters : ctx.num_clusters, n_chunk,
                                      !plain && kCombineAtGemmEntry, true, mx, ctx.alignment()},
              &layout);
+    if (is_mx && wg) {
+      const ep::EpRequantConfig requant{rows, hidden_dim, ne, 0};
+      NVTE_CHECK(requant.get_kernel().has_value(), "the EP MXFP8 requant is not available");
+    }
     if (wg) {
       compile_wgrad(ctx, 2 * ffn_dim, hidden_dim,
                     {{ctx.num_clusters, true, 0}, {ctx.all_clusters - ctx.num_clusters, false, 0}});
@@ -1168,7 +1195,8 @@ size_t nvte_ep_overlap_workspace_size(size_t, size_t, size_t, size_t, int, int,
   ep_gemm_not_built();
 }
 
-void nvte_ep_overlap_compile(size_t, size_t, size_t, size_t, int, int, const NVTEEpLayerConfig*) {
+void nvte_ep_overlap_compile(size_t, size_t, size_t, size_t, int, int, int,
+                             const NVTEEpLayerConfig*) {
   ep_gemm_not_built();
 }
 

@@ -33,6 +33,10 @@ __all__ = [
     "ep_combine_gemm_fwd",
     "ep_combine_gemm_bwd",
     "ep_dispatch_gemm_bwd",
+    "ep_dispatch_gemm_fwd_mxfp8",
+    "ep_combine_gemm_fwd_mxfp8",
+    "ep_combine_gemm_bwd_mxfp8",
+    "ep_dispatch_gemm_bwd_mxfp8",
 ]
 
 
@@ -62,7 +66,14 @@ def ep_overlap_env_reason():
 
 @functools.lru_cache(maxsize=None)
 def ep_overlap_workspace_size(
-    hidden, ffn, num_local_experts, recv_capacity, top_k, alignment, topk_idx_dtype=jnp.int32
+    hidden,
+    ffn,
+    num_local_experts,
+    recv_capacity,
+    top_k,
+    alignment,
+    topk_idx_dtype=jnp.int32,
+    mxfp8=False,
 ):
     """Workspace bytes for every overlap call of a layer.
 
@@ -80,8 +91,8 @@ def ep_overlap_workspace_size(
         dispatch_output_per_expert_alignment=int(alignment),
         topk_idx_dtype=int(jax_dtype_to_te_dtype(jnp.dtype(topk_idx_dtype))),
     )
-    transformer_engine_jax.ep_overlap_compile(fp32_weight_grad=False, **args)
-    return int(transformer_engine_jax.ep_overlap_workspace_size(mxfp8=False, **args))
+    transformer_engine_jax.ep_overlap_compile(fp32_weight_grad=False, mxfp8=bool(mxfp8), **args)
+    return int(transformer_engine_jax.ep_overlap_workspace_size(mxfp8=bool(mxfp8), **args))
 
 
 def _attrs(top_k, alignment, topk_idx_dtype):
@@ -215,4 +226,190 @@ def ep_dispatch_gemm_bwd(
         recv_tokens,
         **_attrs(top_k, alignment, topk_idx_dtype),
     )
+    return grad_tokens, grad_topk, d_w1
+
+
+# ---------------------------------------------------------------------------------------- MXFP8
+# E4M3 data with E8M0 scales per 32 elements. "compact": row-major [rows, cols / 32] (tokens,
+# received rows, dY, grad_expert_out); "swizzled": GEMM-swizzled, flat rows * cols / 32 (weights,
+# act_out, grad_gemm_out, columnwise copies).
+
+_E4M3 = jnp.float8_e4m3fn
+_E8M0 = jnp.float8_e8m0fnu
+
+
+def ep_dispatch_gemm_fwd_mxfp8(
+    topk_idx, tokens, tokens_scale, topk_weights, w1, w1_scale, *, recv_capacity, alignment
+):
+    """MXFP8 dispatch || FC1 + SwiGLU. tokens [T,H] E4M3 with compact scales [T,H/32]; w1
+    [E,2F,H] E4M3 with swizzled scales. Returns (recv_tokens [R,H] E4M3, recv_scale [R,H/32],
+    recv_w [R], gemm_out [R,2F] bf16, act_out [R,F] E4M3 (silu(gate)*up, no prob), act_scale
+    (swizzled), counts, offsets [E+4], handle_mem)."""
+    H = tokens.shape[-1]
+    K = topk_idx.shape[-1]
+    E, F2, _ = w1.shape
+    F = F2 // 2
+    R = recv_capacity
+    hm = int(transformer_engine_jax.ep_handle_mem_size(int(K), int(alignment)))
+    ws = ep_overlap_workspace_size(H, F, E, R, K, alignment, topk_idx.dtype, mxfp8=True)
+    outs = (
+        _sds((R, H), _E4M3),
+        _sds((R, H // 32), _E8M0),
+        _sds((R,), jnp.float32),
+        _sds((R, F2), jnp.bfloat16),
+        _sds((R, F), _E4M3),
+        _sds((R * F // 32,), _E8M0),
+        _sds((E,), jnp.int32),
+        _sds((E + 4,), jnp.int32),
+        _sds((hm,), jnp.uint8),
+        _sds((ws,), jnp.uint8),
+    )
+    res = ffi.ffi_call("te_ep_dispatch_gemm_fwd_mxfp8_ffi", outs)(
+        topk_idx,
+        tokens,
+        tokens_scale,
+        topk_weights,
+        w1,
+        w1_scale,
+        **_attrs(K, alignment, topk_idx.dtype),
+    )
+    return tuple(res[:9])
+
+
+def ep_combine_gemm_fwd_mxfp8(
+    handle_mem,
+    act_out,
+    act_scale,
+    recv_w,
+    offsets,
+    w2,
+    w2_scale,
+    *,
+    num_tokens,
+    top_k,
+    alignment,
+    topk_idx_dtype=jnp.int32,
+):
+    """MXFP8 FC2 || combine; the routing weights are applied to FC2's output. Returns [T, H]."""
+    R, F = act_out.shape
+    E, H, _ = w2.shape
+    ws = ep_overlap_workspace_size(H, F, E, R, top_k, alignment, topk_idx_dtype, mxfp8=True)
+    outs = (
+        _sds((R, H), jnp.bfloat16),
+        _sds((num_tokens, H), jnp.bfloat16),
+        _sds((ws,), jnp.uint8),
+    )
+    _eo, result, _ws = ffi.ffi_call("te_ep_combine_gemm_fwd_mxfp8_ffi", outs)(
+        handle_mem,
+        act_out,
+        act_scale,
+        recv_w,
+        offsets,
+        w2,
+        w2_scale,
+        **_attrs(top_k, alignment, topk_idx_dtype),
+    )
+    return result
+
+
+def ep_combine_gemm_bwd_mxfp8(
+    handle_mem,
+    dy,
+    dy_scale,
+    gemm_out,
+    recv_w,
+    counts,
+    w2_col,
+    w2_col_scale,
+    *,
+    top_k,
+    alignment,
+    weight_grad_dtype=jnp.bfloat16,
+    topk_idx_dtype=jnp.int32,
+):
+    """MXFP8 combine bwd || FC2 dgrad + dSwiGLU, + FC2 wgrad. dy [T,H] E4M3 compact scales; w2_col
+    the columnwise [E,H,F] weight. Returns (grad_gemm_out, its scales, its columnwise copy and
+    scales (all E4M3/swizzled), grad_recv_w [R] f32, d_w2 [E,H,F])."""
+    R, F2 = gemm_out.shape
+    F = F2 // 2
+    E, H, _ = w2_col.shape
+    ws = ep_overlap_workspace_size(H, F, E, R, top_k, alignment, topk_idx_dtype, mxfp8=True)
+    outs = (
+        _sds((R, H), _E4M3),
+        _sds((R, H // 32), _E8M0),
+        _sds((R, H), _E4M3),
+        _sds((R * H // 32,), _E8M0),
+        _sds((R, F2), _E4M3),
+        _sds((R * F2 // 32,), _E8M0),
+        _sds((R, F2), _E4M3),
+        _sds((R * F2 // 32,), _E8M0),
+        _sds((R,), jnp.float32),
+        _sds((R, F), _E4M3),
+        _sds((R * F // 32,), _E8M0),
+        _sds((E, H, F), weight_grad_dtype),
+        _sds((ws,), jnp.uint8),
+    )
+    res = ffi.ffi_call("te_ep_combine_gemm_bwd_mxfp8_ffi", outs)(
+        handle_mem,
+        dy,
+        dy_scale,
+        gemm_out,
+        recv_w,
+        counts,
+        w2_col,
+        w2_col_scale,
+        **_attrs(top_k, alignment, topk_idx_dtype),
+    )
+    _geo, _geo_s, _geo_c, _geo_cs, ggo, ggo_s, ggo_c, ggo_cs, grad_recv_w, _ac, _acs, d_w2, _ = res
+    return ggo, ggo_s, ggo_c, ggo_cs, grad_recv_w, d_w2
+
+
+def ep_dispatch_gemm_bwd_mxfp8(
+    handle_mem,
+    ggo,
+    ggo_s,
+    ggo_c,
+    ggo_cs,
+    grad_recv_w,
+    counts,
+    w1_col,
+    w1_col_scale,
+    recv_tokens,
+    recv_scale,
+    *,
+    num_tokens,
+    top_k,
+    alignment,
+    weight_grad_dtype=jnp.bfloat16,
+    topk_idx_dtype=jnp.int32,
+):
+    """MXFP8 FC1 dgrad + FC1 wgrad || dispatch bwd. Returns (grad_tokens [T,H] bf16,
+    grad_topk_weights [T,K] f32, d_w1 [E,2F,H])."""
+    R, F2 = ggo.shape
+    E, _, H = w1_col.shape
+    ws = ep_overlap_workspace_size(H, F2 // 2, E, R, top_k, alignment, topk_idx_dtype, mxfp8=True)
+    outs = (
+        _sds((R, H), jnp.bfloat16),
+        _sds((num_tokens, H), jnp.bfloat16),
+        _sds((num_tokens, top_k), jnp.float32),
+        _sds((E, F2, H), weight_grad_dtype),
+        _sds((R, H), _E4M3),
+        _sds((R * H // 32,), _E8M0),
+        _sds((ws,), jnp.uint8),
+    )
+    res = ffi.ffi_call("te_ep_dispatch_gemm_bwd_mxfp8_ffi", outs)(
+        handle_mem,
+        ggo,
+        ggo_s,
+        ggo_c,
+        ggo_cs,
+        grad_recv_w,
+        counts,
+        w1_col,
+        w1_col_scale,
+        recv_tokens,
+        recv_scale,
+        **_attrs(top_k, alignment, topk_idx_dtype),
+    )
+    _grt, grad_tokens, grad_topk, d_w1, _rc, _rcs, _ws = res
     return grad_tokens, grad_topk, d_w1

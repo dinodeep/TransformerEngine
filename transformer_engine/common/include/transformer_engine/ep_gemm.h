@@ -239,7 +239,7 @@ size_t nvte_ep_overlap_workspace_size(size_t hidden_dim, size_t ffn_dim, size_t 
                                       size_t recv_capacity, int with_weight_grad, int mxfp8,
                                       const NVTEEpLayerConfig* layer_cfg);
 
-/*! \brief Compile every GEMM the four BF16 calls of a layer use, ahead of the calls.
+/*! \brief Compile every GEMM the four calls of a layer use (BF16 or, with mxfp8, MXFP8), ahead of the calls.
  *  The calls compile their GEMMs on first use, which re-enters Python; a framework that runs the
  *  calls from an execution thread or a CUDA graph capture calls this first (e.g. while tracing),
  *  after the EP group is bootstrapped. Takes the arguments of nvte_ep_overlap_workspace_size;
@@ -247,7 +247,7 @@ size_t nvte_ep_overlap_workspace_size(size_t hidden_dim, size_t ffn_dim, size_t 
  */
 void nvte_ep_overlap_compile(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
                              size_t recv_capacity, int with_weight_grad, int fp32_weight_grad,
-                             const NVTEEpLayerConfig* layer_cfg);
+                             int mxfp8, const NVTEEpLayerConfig* layer_cfg);
 
 #ifdef __cplusplus
 }
