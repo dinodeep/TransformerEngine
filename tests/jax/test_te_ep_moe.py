@@ -504,6 +504,7 @@ def _make_block(
     use_cudnn_fusion,
     activation_type="silu",
     activation_params=None,
+    use_ffn_bias=False,
 ):
     if input_axes is None:
         input_axes = ("batch", *([None] * (INPUT_RANK - 1)))
@@ -526,6 +527,7 @@ def _make_block(
         quant_before_fsdp_ag=quant_before_fsdp_ag,
         use_cudnn_fusion=use_cudnn_fusion,
         dispatch_quantization_recipe=dispatch_quantization_recipe,
+        use_ffn_bias=use_ffn_bias,
     )
     # Custom expert_bias_init lets tests inject a non-zero expert_bias without
     # poking variables['params'] post-init.
@@ -1339,6 +1341,57 @@ def test_ep_checkpoint_names(mesh, monkeypatch, make_block):
     assert np.all(np.isfinite(_to_global_numpy(grad_inputs, mesh)))
     for name in ("gate_kernel", "wi", "wo"):
         assert np.all(np.isfinite(_to_global_numpy(_unwrap(grads["params"][name]), mesh)))
+
+
+def test_saved_dispatch_is_not_recomputed(mesh, make_block):
+    """Saving the dispatch name keeps the dispatch out of the backward pass.
+
+    A re-run dispatch may place rows in a different order, so the saved dispatch outputs must be
+    used with the counts and routing handle of the same call; recomputing those would re-run the
+    dispatch and pair rows of different orders.
+    """
+    block = make_block(dispatch_checkpoint_name="saved_dispatch")
+    inputs = _make_inputs(jax.random.PRNGKey(36))
+    variables, _, _, _ = _init_apply(block, mesh, inputs, jax.random.PRNGKey(37))
+    policy = jax.checkpoint_policies.save_only_these_names("saved_dispatch")
+
+    with _ctx(mesh):
+        x_sh = _shard_inputs(inputs, mesh)
+
+        @partial(jax.checkpoint, policy=policy)
+        def apply(variables, x):
+            return block.apply(variables, x)[0]
+
+        def loss_fn(variables, x):
+            return jnp.mean(apply(variables, x).astype(jnp.float32) ** 2)
+
+        compiled = jax.jit(jax.grad(loss_fn, argnums=(0, 1))).lower(variables, x_sh).compile()
+        hlo = compiled.as_text()
+        grads, grad_x = compiled(variables, x_sh)
+        jax.block_until_ready(grad_x)
+
+    # The EP calls are custom_partitioning primitives, so they appear only in the partitioned HLO.
+    num_dispatches = sum(
+        hlo.count(f'custom_call_target="{target}"')
+        for target in ("te_ep_dispatch_ffi", "te_ep_prepare_and_dispatch_ffi")
+    )
+    assert num_dispatches == 1, f"{num_dispatches} dispatch calls; the backward re-ran it"
+    ref_grads, ref_grad_x = _grad_step(block, variables, mesh, inputs)
+    pairs = [(grad_x, ref_grad_x)] + [
+        (_unwrap(grads["params"][name]), _unwrap(ref_grads["params"][name]))
+        for name in ("gate_kernel", "wi", "wo")
+    ]
+    for got, ref in pairs:
+        got_np = _to_global_numpy(got, mesh).astype(np.float32)
+        ref_np = _to_global_numpy(ref, mesh).astype(np.float32)
+        assert np.linalg.norm(got_np - ref_np) <= 1e-2 * np.linalg.norm(ref_np)
+
+
+def test_rejects_early_weights_with_ffn_bias(mesh, make_block):
+    block = make_block(apply_topk_weights_early=True, use_ffn_bias=True)
+    inputs = _make_inputs(jax.random.PRNGKey(38))
+    with pytest.raises(ValueError, match="wo_bias"):
+        _init_apply(block, mesh, inputs, jax.random.PRNGKey(39))
 
 
 @pytest.mark.skipif(not is_mxfp8_supported, reason=mxfp8_reason)

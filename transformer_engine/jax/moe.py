@@ -1664,8 +1664,12 @@ def _moe_fwd_rule(
             recv_tokens, recv_scale_inv = recv_tokens.data, recv_tokens.scale_inv
         token_counts = jax.lax.with_sharding_constraint(token_counts, NamedSharding(mesh, ep2_spec))
         if dispatch_checkpoint_name is not None:
+            # A re-run dispatch may place rows in a different order, so saved dispatch
+            # outputs must stay paired with the counts and routing handle of the same call.
             recv_tokens = checkpoint_name(recv_tokens, dispatch_checkpoint_name)
             recv_topk_weights = checkpoint_name(recv_topk_weights, dispatch_checkpoint_name)
+            token_counts = checkpoint_name(token_counts, dispatch_checkpoint_name)
+            handle_mem = checkpoint_name(handle_mem, dispatch_checkpoint_name)
             if dispatch_quantizer is not None:
                 recv_scale_inv = checkpoint_name(recv_scale_inv, dispatch_checkpoint_name)
         recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, NamedSharding(mesh, ep3_spec))
@@ -2287,8 +2291,11 @@ def moe(
         JAX rematerialization checkpoint name for the per-expert down projection output.
         ``None`` leaves the value unnamed.
     dispatch_checkpoint_name : Optional[str]
-        JAX rematerialization checkpoint name for the EP dispatch outputs.
-        ``None`` leaves these values unnamed; the opaque prepare handle is never named.
+        JAX rematerialization checkpoint name for the EP dispatch outputs: the received
+        tokens, routing weights and scales, the per-expert token counts and the routing
+        handle. They are saved or recomputed together, so the backward never pairs saved
+        dispatch outputs with a re-run dispatch, whose row order may differ.
+        ``None`` leaves these values unnamed.
     mesh_resource : Optional[MeshResource]
         Physical parallelism resources. ``None`` uses the active
         ``global_shard_guard`` context; an explicit resource takes precedence.
@@ -2349,6 +2356,11 @@ def moe(
     """
     if not isinstance(use_cudnn_fusion, bool):
         raise TypeError("use_cudnn_fusion must be a bool")
+    if apply_topk_weights_early and wo_bias is not None:
+        raise ValueError(
+            "apply_topk_weights_early=True requires wo_bias=None: early weighting scales the"
+            " FC2 input, so the FC2 bias would not be weighted by the routing weights."
+        )
     if dispatch_quantizer is not None and not isinstance(dispatch_quantizer, Quantizer):
         raise TypeError("dispatch_quantizer must be a Quantizer or None")
     act_params = _resolve_moe_activation_params(activation_type, activation_params)

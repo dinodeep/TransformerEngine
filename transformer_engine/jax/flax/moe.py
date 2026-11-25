@@ -120,12 +120,13 @@ class _MoEBlock(TransformerEngineBase):
         If ``True``, multiply expert outputs by their top-k weights
         *inside* each shard before ``ep_combine`` (saves one global
         reduction at the cost of an extra broadcast). Default ``False``.
+        Requires ``use_ffn_bias=False``.
     recv_capacity_per_rank : Optional[int]
         Exact aligned receive capacity per EP rank. ``None`` reserves the
         dropless worst case.
     dispatch_checkpoint_name : Optional[str]
-        JAX rematerialization checkpoint name for the EP dispatch outputs.
-        ``None`` leaves them unnamed.
+        JAX rematerialization checkpoint name for the EP dispatch outputs, including the
+        per-expert token counts and the routing handle. ``None`` leaves them unnamed.
     dispatch_quantization_recipe : Optional[Recipe]
         Recipe used to quantize tokens before EP dispatch so that the dispatch moves quantized
         data plus compact scales instead of high-precision activations. Only MXFP8 recipes are
