@@ -2342,17 +2342,24 @@ def _ep_overlap_fwd(
             recv_w,
             handle_mem,
             (recv_tokens, gemm_out, act_out, counts),
+            (w1_l, w2_l),
         )
 
-    out, total, recv_w, handle_mem, res = shard_map(
+    out, total, recv_w, handle_mem, res, gathered = shard_map(
         body,
         mesh=mesh,
         in_specs=(tok, tok, tok, kspec, kspec),
-        out_specs=(tok, row, row, row, (row2, row2, row2, row)),
+        out_specs=(tok, row, row, row, (row2, row2, row2, row), (kspec, kspec)),
         check_rep=False,
     )(x, topk_idx_3d, topk_w_3d, w1, w2)
     total = total.reshape(-1, 1)
-    return out, total, recv_w, handle_mem, (*res, w1, w2)
+    # Residual weights for the backward: by default the per-EP-rank weights as the GEMMs read them
+    # (already gathered over the data axes), so an FSDP backward does not gather them again; with
+    # NVTE_JAX_EP_OVERLAP_REGATHER=1 the stored (FSDP-sharded) parameters, gathered again in the
+    # backward (less memory, one more all-gather per weight).
+    if os.environ.get("NVTE_JAX_EP_OVERLAP_REGATHER", "0") == "1":
+        gathered = (w1, w2)
+    return out, total, recv_w, handle_mem, (*res, *gathered)
 
 
 def _ep_overlap_bwd(
