@@ -7,6 +7,7 @@
 #ifdef NVTE_WITH_NCCL_EP
 
 #include "transformer_engine/ep.h"
+#include "transformer_engine/ep_gemm.h"
 
 #include <nccl.h>
 
@@ -42,6 +43,9 @@ struct EpBootstrapParams {
   int max_num_sms = 0;
   NVTEDType max_token_dtype = kNVTEBFloat16;
   bool drop_on_overflow = false;
+  // Per-token top-k (0 = unset). Lets NCCL EP pick the HT pull-push flow, which the EP/GEMM
+  // overlap calls (ep_gemm.h) need for their readiness signals.
+  int num_topk = 0;
   // When set, EP borrows XLA's comm (see below): no ncclCommInitRank at
   // bootstrap; nvte_ep_initialize is deferred to the first executable that
   // fetches the borrowed communicator.
@@ -58,6 +62,7 @@ static NVTEEpGroupConfig MakeEpGroupConfig(const EpBootstrapParams& p) {
                            .num_comm_sms = p.max_num_sms,
                            .max_token_dtype = p.max_token_dtype,
                            .zero_copy = 0,
+                           .num_topk = p.num_topk,
                            .drop_on_overflow = p.drop_on_overflow};
 }
 
@@ -191,7 +196,7 @@ struct EpConfig {
 void SetEpBootstrapParams(pybind11::bytes unique_id_bytes_obj, int ep_size, int rank_within_group,
                           int num_experts, int max_tokens_per_rank, int max_recv_tokens_per_rank,
                           int hidden_dim, int max_num_sms, int max_token_dtype,
-                          bool drop_on_overflow, bool borrowed_comm) {
+                          bool drop_on_overflow, bool borrowed_comm, int num_topk) {
   std::string uid_str = unique_id_bytes_obj;
   NVTE_CHECK(static_cast<int>(uid_str.size()) >= 128,
              "unique_id_bytes must be at least 128 bytes (ncclUniqueId size).");
@@ -215,6 +220,7 @@ void SetEpBootstrapParams(pybind11::bytes unique_id_bytes_obj, int ep_size, int 
     g_ep_params.max_num_sms = max_num_sms;
     g_ep_params.max_token_dtype = static_cast<NVTEDType>(max_token_dtype);
     g_ep_params.drop_on_overflow = drop_on_overflow;
+    g_ep_params.num_topk = num_topk;
     g_ep_params.borrowed_comm = borrowed_comm;
     g_ep_params_set = true;
   }
@@ -709,6 +715,282 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(EpCombineBwdHandler, EpCombineBwdFFI,
                                   .Ret<Buffer_Type>()  // grad_expert_out
                                   .Attrs<EpConfig>(),
                               FFI_CudaGraph_Traits);
+
+// ── EP/GEMM overlap (FusedMoE) ──────────────────────────────────────────────
+//
+// The four calls of nvte_ep_*_gemm_* (ep_gemm.h): NCCL EP dispatch/combine overlapped with the
+// CuTeDSL grouped GEMMs through device readiness signals, all on XLA's stream. BF16 only for now.
+// Shapes are per device (the Python side calls these inside shard_map): T local tokens, R the
+// recv capacity, E local experts, H hidden, F the expert FFN size. FC1 weights are [E, 2F, H]
+// with gate/up in alternating 32-row blocks; FC2 weights are [E, H, F]. The workspace is an XLA
+// output buffer of EpOverlapWorkspaceSize bytes, read only during the call.
+
+namespace {
+
+NVTEEpLayerConfig MakeLayerCfg(const EpConfig& config) {
+  return NVTEEpLayerConfig{.struct_size = sizeof(NVTEEpLayerConfig),
+                           .top_k = static_cast<int>(config.top_k),
+                           .dispatch_output_per_expert_alignment =
+                               static_cast<size_t>(config.dispatch_output_per_expert_alignment),
+                           .topk_idx_dtype = static_cast<NVTEDType>(config.topk_idx_dtype)};
+}
+
+std::vector<size_t> Dims2D(const std::vector<size_t>& d) {
+  NVTE_CHECK(!d.empty(), "expected at least 1D buffer");
+  if (d.size() == 1) return {d[0]};
+  size_t lead = 1;
+  for (size_t i = 0; i + 1 < d.size(); ++i) lead *= d[i];
+  return {lead, d.back()};
+}
+
+template <typename B>
+std::vector<size_t> DimsOf(const B& b) {
+  std::vector<size_t> out;
+  for (auto x : b.dimensions()) out.push_back(static_cast<size_t>(x));
+  return out;
+}
+
+TensorWrapper WrapArg(Buffer_Type b, bool flatten = true) {
+  auto d = DimsOf(b);
+  return TensorWrapper(b.untyped_data(), flatten ? Dims2D(d) : d,
+                       convert_ffi_datatype_to_te_dtype(b.element_type()));
+}
+
+TensorWrapper WrapRet(Result_Type b, bool flatten = true) {
+  auto d = DimsOf(*b);
+  return TensorWrapper(b->untyped_data(), flatten ? Dims2D(d) : d,
+                       convert_ffi_datatype_to_te_dtype(b->element_type()));
+}
+
+TensorWrapper WrapBytes(void* ptr, size_t n) {
+  return TensorWrapper(ptr, std::vector<size_t>{n}, DType::kByte);
+}
+
+// expert_token_offsets is allocated as [E + 4] int32 and used from element 3, so that
+// expert_token_offsets[1:] starts 16-byte aligned (XLA buffers are at least 16-byte aligned).
+TensorWrapper WrapOffsets(void* base, size_t padded_count) {
+  NVTE_CHECK(padded_count >= 5, "expert_token_offsets must be [E + 4] int32");
+  return TensorWrapper(static_cast<int32_t*>(base) + 3, std::vector<size_t>{padded_count - 3},
+                       DType::kInt32);
+}
+
+}  // namespace
+
+size_t EpOverlapWorkspaceSize(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
+                              size_t recv_capacity, bool with_weight_grad, bool mxfp8, int top_k,
+                              size_t dispatch_output_per_expert_alignment, int topk_idx_dtype) {
+  NVTEEpLayerConfig layer_cfg{
+      .struct_size = sizeof(NVTEEpLayerConfig),
+      .top_k = top_k,
+      .dispatch_output_per_expert_alignment = dispatch_output_per_expert_alignment,
+      .topk_idx_dtype = static_cast<NVTEDType>(topk_idx_dtype)};
+  return nvte_ep_overlap_workspace_size(hidden_dim, ffn_dim, num_local_experts, recv_capacity,
+                                        with_weight_grad ? 1 : 0, mxfp8 ? 1 : 0, &layer_cfg);
+}
+
+// Dispatch overlapped with FC1 + SwiGLU (act_out = silu(gate) * up * prob).
+Error_Type EpDispatchGemmFwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
+                                Buffer_Type topk_idx, Buffer_Type tokens, Buffer_Type topk_weights,
+                                Buffer_Type weight, Result_Type recv_tokens,
+                                Result_Type recv_topk_weights, Result_Type gemm_out,
+                                Result_Type act_out, Result_Type recv_tokens_per_expert,
+                                Result_Type expert_token_offsets, Result_Type handle_mem,
+                                Result_Type workspace, EpConfig config) {
+  (void)ep_state;
+  auto layer_cfg = MakeLayerCfg(config);
+  return ffi_guard("EP dispatch_gemm_fwd failed: ", [&] {
+    NVTE_CHECK(tokens.element_type() == ::xla::ffi::DataType::BF16,
+               "EP overlap: tokens must be bfloat16 (MXFP8 is not wired up in JAX yet)");
+    NVTE_CHECK(topk_weights.element_type() == ::xla::ffi::DataType::F32,
+               "EP overlap: topk_weights must be float32");
+    auto topk_idx_ = WrapArg(topk_idx);
+    auto tokens_ = WrapArg(tokens);
+    auto topk_weights_ = WrapArg(topk_weights);
+    auto weight_ = WrapArg(weight, false);
+    auto recv_tokens_ = WrapRet(recv_tokens);
+    auto recv_w_ = TensorWrapper(recv_topk_weights->untyped_data(),
+                                 std::vector<size_t>{recv_topk_weights->element_count()},
+                                 DType::kFloat32);
+    auto gemm_out_ = WrapRet(gemm_out);
+    auto act_out_ = WrapRet(act_out);
+    auto counts_ = TensorWrapper(recv_tokens_per_expert->untyped_data(),
+                                 std::vector<size_t>{recv_tokens_per_expert->element_count()},
+                                 DType::kInt32);
+    auto offsets_ = WrapOffsets(expert_token_offsets->untyped_data(),
+                                expert_token_offsets->element_count());
+    auto handle_mem_ = WrapBytes(handle_mem->untyped_data(), handle_mem->size_bytes());
+    auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
+    nvte_ep_dispatch_gemm_fwd(handle_mem_.data(), topk_idx_.data(), tokens_.data(),
+                              NVTECommWindow{nullptr, 0}, topk_weights_.data(), weight_.data(),
+                              recv_tokens_.data(), recv_w_.data(), gemm_out_.data(),
+                              act_out_.data(), counts_.data(), offsets_.data(), nullptr,
+                              ws_.data(), &layer_cfg, stream);
+  });
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(EpDispatchGemmFwdHandler, EpDispatchGemmFwdFFI,
+                              FFI::Bind()
+                                  .Ctx<FFI_Stream_Type>()
+                                  .Ctx<::xla::ffi::State<EpInstanceState>>()
+                                  .Arg<Buffer_Type>()  // topk_idx [T, K]
+                                  .Arg<Buffer_Type>()  // tokens [T, H]
+                                  .Arg<Buffer_Type>()  // topk_weights [T, K] f32
+                                  .Arg<Buffer_Type>()  // weight [E, 2F, H]
+                                  .Ret<Buffer_Type>()  // recv_tokens [R, H]
+                                  .Ret<Buffer_Type>()  // recv_topk_weights [R] f32
+                                  .Ret<Buffer_Type>()  // gemm_out [R, 2F]
+                                  .Ret<Buffer_Type>()  // act_out [R, F]
+                                  .Ret<Buffer_Type>()  // recv_tokens_per_expert [E] i32
+                                  .Ret<Buffer_Type>()  // expert_token_offsets [E + 4] i32
+                                  .Ret<Buffer_Type>()  // handle_mem
+                                  .Ret<Buffer_Type>()  // workspace
+                                  .Attrs<EpConfig>());
+
+// FC2 overlapped with the combine. BF16: routing weights already in act_out (null here).
+Error_Type EpCombineGemmFwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
+                               Buffer_Type handle_mem, Buffer_Type act_out,
+                               Buffer_Type expert_token_offsets, Buffer_Type weight,
+                               Result_Type expert_out, Result_Type result, Result_Type workspace,
+                               EpConfig config) {
+  (void)ep_state;
+  auto layer_cfg = MakeLayerCfg(config);
+  return ffi_guard("EP combine_gemm_fwd failed: ", [&] {
+    auto handle_mem_ = WrapBytes(handle_mem.untyped_data(), handle_mem.size_bytes());
+    auto act_out_ = WrapArg(act_out);
+    auto offsets_ =
+        WrapOffsets(expert_token_offsets.untyped_data(), expert_token_offsets.element_count());
+    auto weight_ = WrapArg(weight, false);
+    auto expert_out_ = WrapRet(expert_out);
+    auto result_ = WrapRet(result);
+    auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
+    nvte_ep_combine_gemm_fwd(handle_mem_.data(), act_out_.data(), nullptr, offsets_.data(),
+                             weight_.data(), expert_out_.data(), result_.data(), ws_.data(),
+                             &layer_cfg, stream);
+  });
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(EpCombineGemmFwdHandler, EpCombineGemmFwdFFI,
+                              FFI::Bind()
+                                  .Ctx<FFI_Stream_Type>()
+                                  .Ctx<::xla::ffi::State<EpInstanceState>>()
+                                  .Arg<Buffer_Type>()  // handle_mem
+                                  .Arg<Buffer_Type>()  // act_out [R, F]
+                                  .Arg<Buffer_Type>()  // expert_token_offsets [E + 4] i32
+                                  .Arg<Buffer_Type>()  // weight [E, H, F]
+                                  .Ret<Buffer_Type>()  // expert_out [R, H]
+                                  .Ret<Buffer_Type>()  // result [T, H]
+                                  .Ret<Buffer_Type>()  // workspace
+                                  .Attrs<EpConfig>());
+
+// Combine backward overlapped with FC2 dgrad + SwiGLU backward (+ FC2 wgrad).
+Error_Type EpCombineGemmBwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
+                               Buffer_Type handle_mem, Buffer_Type grad_result,
+                               Buffer_Type gemm_out, Buffer_Type recv_topk_weights,
+                               Buffer_Type recv_tokens_per_expert, Buffer_Type weight,
+                               Buffer_Type wgrad_input, Result_Type grad_expert_out,
+                               Result_Type grad_gemm_out, Result_Type grad_recv_topk_weights,
+                               Result_Type weight_grad, Result_Type workspace, EpConfig config) {
+  const bool compute_wgrad = true;  // always produce the FC2 weight gradient
+  (void)ep_state;
+  auto layer_cfg = MakeLayerCfg(config);
+  return ffi_guard("EP combine_gemm_bwd failed: ", [&] {
+    auto handle_mem_ = WrapBytes(handle_mem.untyped_data(), handle_mem.size_bytes());
+    auto grad_result_ = WrapArg(grad_result);
+    auto gemm_out_ = WrapArg(gemm_out);
+    auto recv_w_ = TensorWrapper(recv_topk_weights.untyped_data(),
+                                 std::vector<size_t>{recv_topk_weights.element_count()},
+                                 DType::kFloat32);
+    auto counts_ = TensorWrapper(recv_tokens_per_expert.untyped_data(),
+                                 std::vector<size_t>{recv_tokens_per_expert.element_count()},
+                                 DType::kInt32);
+    auto weight_ = WrapArg(weight, false);
+    auto wgrad_input_ = WrapArg(wgrad_input);
+    auto grad_expert_out_ = WrapRet(grad_expert_out);
+    auto grad_gemm_out_ = WrapRet(grad_gemm_out);
+    auto grad_recv_w_ = TensorWrapper(grad_recv_topk_weights->untyped_data(),
+                                      std::vector<size_t>{grad_recv_topk_weights->element_count()},
+                                      DType::kFloat32);
+    auto weight_grad_ = WrapRet(weight_grad, false);
+    auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
+    nvte_ep_combine_gemm_bwd(handle_mem_.data(), grad_result_.data(), NVTECommWindow{nullptr, 0},
+                             gemm_out_.data(), recv_w_.data(), counts_.data(), weight_.data(),
+                             compute_wgrad ? wgrad_input_.data() : nullptr,
+                             grad_expert_out_.data(), grad_gemm_out_.data(), grad_recv_w_.data(),
+                             nullptr, compute_wgrad ? weight_grad_.data() : nullptr, 0,
+                             ws_.data(), &layer_cfg, stream);
+  });
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(EpCombineGemmBwdHandler, EpCombineGemmBwdFFI,
+                              FFI::Bind()
+                                  .Ctx<FFI_Stream_Type>()
+                                  .Ctx<::xla::ffi::State<EpInstanceState>>()
+                                  .Arg<Buffer_Type>()  // handle_mem
+                                  .Arg<Buffer_Type>()  // grad_result [T, H]
+                                  .Arg<Buffer_Type>()  // gemm_out [R, 2F]
+                                  .Arg<Buffer_Type>()  // recv_topk_weights [R] f32
+                                  .Arg<Buffer_Type>()  // recv_tokens_per_expert [E] i32
+                                  .Arg<Buffer_Type>()  // weight [E, H, F]
+                                  .Arg<Buffer_Type>()  // wgrad_input = act_out [R, F]
+                                  .Ret<Buffer_Type>()  // grad_expert_out [R, H]
+                                  .Ret<Buffer_Type>()  // grad_gemm_out [R, 2F]
+                                  .Ret<Buffer_Type>()  // grad_recv_topk_weights [R] f32
+                                  .Ret<Buffer_Type>()  // weight_grad [E, H, F]
+                                  .Ret<Buffer_Type>()  // workspace
+                                  .Attrs<EpConfig>());
+
+// FC1 dgrad (+ FC1 wgrad) overlapped with the dispatch backward (a combine of gradients).
+Error_Type EpDispatchGemmBwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
+                                Buffer_Type handle_mem, Buffer_Type grad_gemm_out,
+                                Buffer_Type grad_recv_topk_weights,
+                                Buffer_Type recv_tokens_per_expert, Buffer_Type weight,
+                                Buffer_Type wgrad_input, Result_Type grad_recv_tokens,
+                                Result_Type grad_tokens, Result_Type grad_topk_weights,
+                                Result_Type weight_grad, Result_Type workspace, EpConfig config) {
+  const bool compute_wgrad = true;  // always produce the FC1 weight gradient
+  (void)ep_state;
+  auto layer_cfg = MakeLayerCfg(config);
+  return ffi_guard("EP dispatch_gemm_bwd failed: ", [&] {
+    auto handle_mem_ = WrapBytes(handle_mem.untyped_data(), handle_mem.size_bytes());
+    auto grad_gemm_out_ = WrapArg(grad_gemm_out);
+    auto grad_recv_w_ = TensorWrapper(grad_recv_topk_weights.untyped_data(),
+                                      std::vector<size_t>{grad_recv_topk_weights.element_count()},
+                                      DType::kFloat32);
+    auto counts_ = TensorWrapper(recv_tokens_per_expert.untyped_data(),
+                                 std::vector<size_t>{recv_tokens_per_expert.element_count()},
+                                 DType::kInt32);
+    auto weight_ = WrapArg(weight, false);
+    auto wgrad_input_ = WrapArg(wgrad_input);
+    auto grad_recv_tokens_ = WrapRet(grad_recv_tokens);
+    auto grad_tokens_ = WrapRet(grad_tokens);
+    auto grad_topk_ = WrapRet(grad_topk_weights);
+    auto weight_grad_ = WrapRet(weight_grad, false);
+    auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
+    nvte_ep_dispatch_gemm_bwd(handle_mem_.data(), grad_gemm_out_.data(), grad_recv_w_.data(),
+                              counts_.data(), weight_.data(),
+                              compute_wgrad ? wgrad_input_.data() : nullptr,
+                              grad_recv_tokens_.data(), grad_tokens_.data(), grad_topk_.data(),
+                              compute_wgrad ? weight_grad_.data() : nullptr, 0, ws_.data(),
+                              &layer_cfg, stream);
+  });
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(EpDispatchGemmBwdHandler, EpDispatchGemmBwdFFI,
+                              FFI::Bind()
+                                  .Ctx<FFI_Stream_Type>()
+                                  .Ctx<::xla::ffi::State<EpInstanceState>>()
+                                  .Arg<Buffer_Type>()  // handle_mem
+                                  .Arg<Buffer_Type>()  // grad_gemm_out [R, 2F]
+                                  .Arg<Buffer_Type>()  // grad_recv_topk_weights [R] f32
+                                  .Arg<Buffer_Type>()  // recv_tokens_per_expert [E] i32
+                                  .Arg<Buffer_Type>()  // weight [E, 2F, H]
+                                  .Arg<Buffer_Type>()  // wgrad_input = recv_tokens [R, H]
+                                  .Ret<Buffer_Type>()  // grad_recv_tokens [R, H]
+                                  .Ret<Buffer_Type>()  // grad_tokens [T, H]
+                                  .Ret<Buffer_Type>()  // grad_topk_weights [T, K] f32
+                                  .Ret<Buffer_Type>()  // weight_grad [E, 2F, H]
+                                  .Ret<Buffer_Type>()  // workspace
+                                  .Attrs<EpConfig>());
 
 // -- Borrowed-comm path -------------------------------------------------------
 //

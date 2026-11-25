@@ -140,6 +140,19 @@ pybind11::dict Registrations() {
   dict["te_ep_combine_bwd_ffi"] =
       pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
                      pybind11::arg("execute") = EncapsulateFFI(EpCombineBwdHandler));
+  // EP/GEMM overlap (FusedMoE): NCCL EP dispatch/combine overlapped with CuTeDSL grouped GEMMs.
+  dict["te_ep_dispatch_gemm_fwd_ffi"] =
+      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
+                     pybind11::arg("execute") = EncapsulateFFI(EpDispatchGemmFwdHandler));
+  dict["te_ep_combine_gemm_fwd_ffi"] =
+      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
+                     pybind11::arg("execute") = EncapsulateFFI(EpCombineGemmFwdHandler));
+  dict["te_ep_combine_gemm_bwd_ffi"] =
+      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
+                     pybind11::arg("execute") = EncapsulateFFI(EpCombineGemmBwdHandler));
+  dict["te_ep_dispatch_gemm_bwd_ffi"] =
+      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
+                     pybind11::arg("execute") = EncapsulateFFI(EpDispatchGemmBwdHandler));
 
   // Borrowed-comm bootstrap: a one-shot op requests the collective clique
   // (generic prepare) and initializes EPBackend from the borrowed comm (EP
@@ -188,11 +201,17 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
         pybind11::arg("ep_size"), pybind11::arg("rank_within_group"), pybind11::arg("num_experts"),
         pybind11::arg("max_tokens_per_rank"), pybind11::arg("max_recv_tokens_per_rank"),
         pybind11::arg("hidden_dim"), pybind11::arg("max_num_sms"), pybind11::arg("max_token_dtype"),
-        pybind11::arg("drop_on_overflow"), pybind11::arg("borrowed_comm") = false);
+        pybind11::arg("drop_on_overflow"), pybind11::arg("borrowed_comm") = false,
+        pybind11::arg("num_topk") = 0);
   m.def("release_ep_resources", &ReleaseEpResources);
   m.def("release_ep_resources_at_exit", &ReleaseEpResourcesAtExit);
   m.def("ep_handle_mem_size", &EpHandleMemSize, pybind11::arg("top_k"),
         pybind11::arg("dispatch_output_per_expert_alignment") = 0);
+  m.def("ep_overlap_workspace_size", &EpOverlapWorkspaceSize, pybind11::arg("hidden_dim"),
+        pybind11::arg("ffn_dim"), pybind11::arg("num_local_experts"),
+        pybind11::arg("recv_capacity"), pybind11::arg("with_weight_grad"), pybind11::arg("mxfp8"),
+        pybind11::arg("top_k"), pybind11::arg("dispatch_output_per_expert_alignment"),
+        pybind11::arg("topk_idx_dtype"), pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("get_ep_instance_state_type_id", &GetEpInstanceStateTypeIdCapsule);
   m.def("get_ep_instance_state_type_info", &GetEpInstanceStateTypeInfoCapsule);
 #endif  // NVTE_WITH_NCCL_EP

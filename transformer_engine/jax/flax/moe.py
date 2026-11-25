@@ -125,6 +125,13 @@ class _MoEBlock(TransformerEngineBase):
         callers do not consume the counts to avoid the associated all-reduce;
         the returned ``expert_counts`` is then a zero-filled array.
 
+    enable_ep_overlap : bool
+        Overlap the EP dispatch/combine with the expert grouped GEMMs (NCCL EP + CuTeDSL
+        readiness signals, forward and backward). Needs ``NVTE_ENABLE_CUTEDSL_BACKEND=1`` and
+        ``NVTE_MOE_OVERLAP``; BF16, SwiGLU, no biases, hidden a multiple of 256 and
+        ``intermediate_size`` a multiple of 64. Ineligible layers warn and use the regular path.
+        Default ``False``.
+
     Per-expert dispatch-slot alignment is 256 tokens when fusion is requested,
     including fallbacks, and 128 tokens with ``use_cudnn_fusion=False``.
 
@@ -173,6 +180,7 @@ class _MoEBlock(TransformerEngineBase):
     dispatch_checkpoint_name: Optional[str] = None
     dispatch_quantization_recipe: Optional[Recipe] = None
     collect_expert_counts: bool = True
+    enable_ep_overlap: bool = False
 
     # Dtypes / init / misc
     dtype: DType = jnp.float32
@@ -355,4 +363,5 @@ class _MoEBlock(TransformerEngineBase):
                 dtype=self.dtype,
                 dispatch_checkpoint_name=self.dispatch_checkpoint_name,
                 dispatch_quantizer=dispatch_quantizer,
+                enable_ep_overlap=self.enable_ep_overlap,
             )

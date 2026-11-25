@@ -40,6 +40,7 @@ stateful recipes follow the same update semantics as the other TE MLPs.
 """
 
 import math
+import os
 import warnings
 from dataclasses import replace
 from functools import partial
@@ -53,6 +54,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from . import cpp_extensions as tex
+from .cpp_extensions import ep_overlap as tex_ep_overlap
 from .cpp_extensions.misc import jax_dtype_to_te_dtype
 from .quantize import (
     GroupedScaledTensor1x,
@@ -573,6 +575,8 @@ class _Ctx:
     aux_saved_scores: Any = None
     # Caller-supplied routing only: dtype of the routing_weights cotangent.
     routing_weights_dtype: Any = flax.struct.field(pytree_node=False, default=None)
+    # EP/GEMM overlap path only: per-device residuals of the fused calls (see _ep_overlap_fwd).
+    overlap: Any = None
 
 
 # =============================================================================
@@ -1356,6 +1360,7 @@ def _moe_fwd_rule(
     quant_before_fsdp_ag,
     use_cudnn_fusion: bool = True,
     cudnn_native_weight_layout: Optional[bool] = None,
+    use_ep_overlap: bool = False,
 ):
     """Forward: [gate -> route ->] ep_dispatch -> FFN -> ep_combine.
 
@@ -1591,6 +1596,62 @@ def _moe_fwd_rule(
         topk_idx_3d = jax.lax.with_sharding_constraint(topk_idx_3d, NamedSharding(mesh, ep3_spec))
         topk_w_3d = jax.lax.with_sharding_constraint(topk_w_3d, NamedSharding(mesh, ep3_spec))
 
+        if use_ep_overlap:
+            cfg = tex.EpLayerConfig(
+                top_k=K,
+                dispatch_output_per_expert_alignment=dispatch_alignment,
+                topk_idx_dtype=int(jax_dtype_to_te_dtype(topk_idx_3d.dtype)),
+            )
+            output, total_recv_tokens, recv_topk_weights, handle_mem, overlap_res = (
+                _ep_overlap_fwd(
+                    x,
+                    topk_idx_3d,
+                    topk_w_3d,
+                    wi,
+                    wo,
+                    mesh=mesh,
+                    batch_axes=batch_pspec_axis,
+                    ep_axis=ep_axis,
+                    cfg=cfg,
+                    recv_pr=recv_pr,
+                    native_layout=cudnn_native_weight_layout,
+                )
+            )
+            output = with_sharding_constraint_by_logical_axes(output, input_axes)
+            ctx = _Ctx(
+                x=x,
+                router=router,
+                logits_2d=logits_2d,
+                saved_scores=saved_scores,
+                routing_map=routing_map,
+                selected_experts=selected_experts,
+                cfg=cfg,
+                handle_mem=handle_mem,
+                recv_topk_weights=recv_topk_weights,
+                casted_sorted_x_lhs_trans=None,
+                casted_wi_rhs_trans=None,
+                gate_proj_out=None,
+                up_proj_out=None,
+                casted_intermediate_lhs_trans=None,
+                casted_wo_rhs_trans=None,
+                expert_outputs=None,
+                local_group_sizes=None,
+                quantizer_sets=quantizer_sets,
+                aux_tokens_per_expert=aux_tokens_per_expert,
+                aux_saved_scores=aux_saved_scores,
+                routing_weights_dtype=(
+                    None if router is not None else router_info.routing_weights.dtype
+                ),
+                overlap=overlap_res,
+            )
+            static = {
+                "has_bias": False,
+                "x_shape": x.shape,
+                "recv_pr": recv_pr,
+                "cudnn_native_weight_layout": cudnn_native_weight_layout,
+            }
+            return (output, aux_loss, total_recv_tokens, expert_counts), (ctx, static)
+
         # ---------------- TE EP dispatch (global view) ----------------
         cfg = tex.EpLayerConfig(
             top_k=K,
@@ -1798,6 +1859,7 @@ def _moe_bwd_rule(
     quant_before_fsdp_ag,
     use_cudnn_fusion,
     cudnn_native_weight_layout,
+    use_ep_overlap,
     residuals,
     cotangents,
 ):
@@ -1815,6 +1877,7 @@ def _moe_bwd_rule(
             quant_before_fsdp_ag,
             use_cudnn_fusion,
             cudnn_native_weight_layout,
+            use_ep_overlap,
         )  # captured / unused in bwd
         from jax.experimental.shard_map import shard_map
 
@@ -1840,142 +1903,158 @@ def _moe_bwd_rule(
         ep2_spec = P(batch_pspec_axis, None)
         out_partition_spec = (batch_pspec_axis, None, None)
 
-        # ---------------- Combine bwd (global view) ----------------
-        d_output = jax.lax.with_sharding_constraint(d_output, NamedSharding(mesh, ep3_spec))
-        grad_pre_combine = tex.ep_combine_bwd(ctx.cfg, ctx.handle_mem, d_output, recv_pr)
-        grad_pre_combine = jax.lax.with_sharding_constraint(
-            grad_pre_combine, NamedSharding(mesh, ep3_spec)
-        )
-        if apply_topk_weights_early:
-            # combine_fwd consumed already-weighted expert_outputs; the recv_w
-            # cotangent flows through the early-weighting step inside the FFN bwd.
-            d_expert_outputs = grad_pre_combine
-            d_recv_w_from_combine = jnp.zeros_like(ctx.recv_topk_weights)
-        else:
-            w = ctx.recv_topk_weights[..., None].astype(grad_pre_combine.dtype)
-            d_expert_outputs = grad_pre_combine * w
-            d_recv_w_from_combine = (grad_pre_combine * ctx.expert_outputs).sum(axis=-1)
-            d_recv_w_from_combine = d_recv_w_from_combine.astype(ctx.recv_topk_weights.dtype)
-
-        # ---------------- FFN bwd (per-shard via shard_map) ----------------
-        kernel_spec = P(ep_axis, None, None)
-        bias_spec = P(ep_axis, None)
-        token_buffer_spec = P(batch_pspec_axis)
-        token_matrix_spec = P(batch_pspec_axis, None)
-        expert_buffer_spec = P(ep_axis)
-        residuals_specs = (
-            token_buffer_spec,
-            expert_buffer_spec,
-            token_matrix_spec,
-            token_matrix_spec,
-            token_buffer_spec,
-            expert_buffer_spec,
-            ep2_spec,
-        )
-        bwd_in_specs = (ep3_spec, *residuals_specs, ep2_spec)
-        bwd_in_args = [
-            d_expert_outputs,
-            ctx.casted_sorted_x_lhs_trans,
-            ctx.casted_wi_rhs_trans,
-            ctx.gate_proj_out,
-            ctx.up_proj_out,
-            ctx.casted_intermediate_lhs_trans,
-            ctx.casted_wo_rhs_trans,
-            ctx.local_group_sizes,
-            ctx.recv_topk_weights,
-        ]
-
-        def _ffn_bwd_body(*args):
-            grads = _ffn_bwd_per_shard(
-                *args,
-                ctx.quantizer_sets,
-                activation_type=activation_type,
-                apply_topk_weights_early=apply_topk_weights_early,
-                has_bias=has_bias,
-                use_cudnn_jax_fusion=use_cudnn_jax_fusion,
-                cudnn_native_weight_layout=static["cudnn_native_weight_layout"],
+        if ctx.overlap is not None:
+            d_output = jax.lax.with_sharding_constraint(d_output, NamedSharding(mesh, ep3_spec))
+            d_x_from_dispatch, d_topk_w, d_wi, d_wo = _ep_overlap_bwd(
+                d_output.astype(ctx.x.dtype),
+                ctx.handle_mem,
+                ctx.recv_topk_weights,
+                ctx.overlap,
+                mesh=mesh,
+                batch_axes=batch_pspec_axis,
+                ep_axis=ep_axis,
+                dp_axes=tuple(data_parallelism_axes),
+                cfg=ctx.cfg,
+                native_layout=static["cudnn_native_weight_layout"],
             )
+            d_wi_0_bias = d_wi_1_bias = d_wo_bias = None
+        else:
+            # ---------------- Combine bwd (global view) ----------------
+            d_output = jax.lax.with_sharding_constraint(d_output, NamedSharding(mesh, ep3_spec))
+            grad_pre_combine = tex.ep_combine_bwd(ctx.cfg, ctx.handle_mem, d_output, recv_pr)
+            grad_pre_combine = jax.lax.with_sharding_constraint(
+                grad_pre_combine, NamedSharding(mesh, ep3_spec)
+            )
+            if apply_topk_weights_early:
+                # combine_fwd consumed already-weighted expert_outputs; the recv_w
+                # cotangent flows through the early-weighting step inside the FFN bwd.
+                d_expert_outputs = grad_pre_combine
+                d_recv_w_from_combine = jnp.zeros_like(ctx.recv_topk_weights)
+            else:
+                w = ctx.recv_topk_weights[..., None].astype(grad_pre_combine.dtype)
+                d_expert_outputs = grad_pre_combine * w
+                d_recv_w_from_combine = (grad_pre_combine * ctx.expert_outputs).sum(axis=-1)
+                d_recv_w_from_combine = d_recv_w_from_combine.astype(ctx.recv_topk_weights.dtype)
+
+            # ---------------- FFN bwd (per-shard via shard_map) ----------------
+            kernel_spec = P(ep_axis, None, None)
+            bias_spec = P(ep_axis, None)
+            token_buffer_spec = P(batch_pspec_axis)
+            token_matrix_spec = P(batch_pspec_axis, None)
+            expert_buffer_spec = P(ep_axis)
+            residuals_specs = (
+                token_buffer_spec,
+                expert_buffer_spec,
+                token_matrix_spec,
+                token_matrix_spec,
+                token_buffer_spec,
+                expert_buffer_spec,
+                ep2_spec,
+            )
+            bwd_in_specs = (ep3_spec, *residuals_specs, ep2_spec)
+            bwd_in_args = [
+                d_expert_outputs,
+                ctx.casted_sorted_x_lhs_trans,
+                ctx.casted_wi_rhs_trans,
+                ctx.gate_proj_out,
+                ctx.up_proj_out,
+                ctx.casted_intermediate_lhs_trans,
+                ctx.casted_wo_rhs_trans,
+                ctx.local_group_sizes,
+                ctx.recv_topk_weights,
+            ]
+
+            def _ffn_bwd_body(*args):
+                grads = _ffn_bwd_per_shard(
+                    *args,
+                    ctx.quantizer_sets,
+                    activation_type=activation_type,
+                    apply_topk_weights_early=apply_topk_weights_early,
+                    has_bias=has_bias,
+                    use_cudnn_jax_fusion=use_cudnn_jax_fusion,
+                    cudnn_native_weight_layout=static["cudnn_native_weight_layout"],
+                )
+                (
+                    d_sorted_x_local,
+                    d_recv_w_local,
+                    d_wi_local,
+                    d_wo_local,
+                    d_wi_0_bias_local,
+                    d_wi_1_bias_local,
+                    d_wo_bias_local,
+                ) = grads
+                if data_parallelism_axes:
+                    dp_axes = tuple(data_parallelism_axes)
+                    d_wi_local = jax.lax.psum(d_wi_local, axis_name=dp_axes)
+                    d_wo_local = jax.lax.psum(d_wo_local, axis_name=dp_axes)
+                    if has_bias:
+                        d_wi_0_bias_local = jax.lax.psum(d_wi_0_bias_local, axis_name=dp_axes)
+                        d_wi_1_bias_local = jax.lax.psum(d_wi_1_bias_local, axis_name=dp_axes)
+                        d_wo_bias_local = jax.lax.psum(d_wo_bias_local, axis_name=dp_axes)
+                return (
+                    d_sorted_x_local,
+                    d_recv_w_local,
+                    d_wi_local,
+                    d_wo_local,
+                    d_wi_0_bias_local,
+                    d_wi_1_bias_local,
+                    d_wo_bias_local,
+                )
+
+            if has_bias:
+                bwd_out_specs = (
+                    ep3_spec,
+                    ep2_spec,
+                    kernel_spec,
+                    kernel_spec,
+                    bias_spec,
+                    bias_spec,
+                    bias_spec,
+                )
+            else:
+                bwd_out_specs = (
+                    ep3_spec,
+                    ep2_spec,
+                    kernel_spec,
+                    kernel_spec,
+                    None,
+                    None,
+                    None,
+                )
+
             (
-                d_sorted_x_local,
-                d_recv_w_local,
-                d_wi_local,
-                d_wo_local,
-                d_wi_0_bias_local,
-                d_wi_1_bias_local,
-                d_wo_bias_local,
-            ) = grads
-            if data_parallelism_axes:
-                dp_axes = tuple(data_parallelism_axes)
-                d_wi_local = jax.lax.psum(d_wi_local, axis_name=dp_axes)
-                d_wo_local = jax.lax.psum(d_wo_local, axis_name=dp_axes)
-                if has_bias:
-                    d_wi_0_bias_local = jax.lax.psum(d_wi_0_bias_local, axis_name=dp_axes)
-                    d_wi_1_bias_local = jax.lax.psum(d_wi_1_bias_local, axis_name=dp_axes)
-                    d_wo_bias_local = jax.lax.psum(d_wo_bias_local, axis_name=dp_axes)
-            return (
-                d_sorted_x_local,
-                d_recv_w_local,
-                d_wi_local,
-                d_wo_local,
-                d_wi_0_bias_local,
-                d_wi_1_bias_local,
-                d_wo_bias_local,
+                d_sorted_x,
+                d_recv_w_from_intermediate,
+                d_wi,
+                d_wo,
+                d_wi_0_bias,
+                d_wi_1_bias,
+                d_wo_bias,
+            ) = shard_map(
+                _ffn_bwd_body,
+                mesh=mesh,
+                in_specs=bwd_in_specs,
+                out_specs=bwd_out_specs,
+                check_rep=False,
+            )(
+                *bwd_in_args
             )
 
-        if has_bias:
-            bwd_out_specs = (
-                ep3_spec,
-                ep2_spec,
-                kernel_spec,
-                kernel_spec,
-                bias_spec,
-                bias_spec,
-                bias_spec,
+            d_recv_w_total = d_recv_w_from_combine + d_recv_w_from_intermediate
+
+            # ---------------- Dispatch bwd (global view) ----------------
+            d_sorted_x = jax.lax.with_sharding_constraint(d_sorted_x, NamedSharding(mesh, ep3_spec))
+            d_recv_w_total = jax.lax.with_sharding_constraint(
+                d_recv_w_total, NamedSharding(mesh, ep2_spec)
             )
-        else:
-            bwd_out_specs = (
-                ep3_spec,
-                ep2_spec,
-                kernel_spec,
-                kernel_spec,
-                None,
-                None,
-                None,
+            d_x_from_dispatch, d_topk_w = tex.ep_dispatch_bwd(
+                ctx.cfg,
+                ctx.handle_mem,
+                d_sorted_x,
+                d_recv_w_total,
+                num_local_tokens=(B, S),
+                out_partition_spec=out_partition_spec,
             )
-
-        (
-            d_sorted_x,
-            d_recv_w_from_intermediate,
-            d_wi,
-            d_wo,
-            d_wi_0_bias,
-            d_wi_1_bias,
-            d_wo_bias,
-        ) = shard_map(
-            _ffn_bwd_body,
-            mesh=mesh,
-            in_specs=bwd_in_specs,
-            out_specs=bwd_out_specs,
-            check_rep=False,
-        )(
-            *bwd_in_args
-        )
-
-        d_recv_w_total = d_recv_w_from_combine + d_recv_w_from_intermediate
-
-        # ---------------- Dispatch bwd (global view) ----------------
-        d_sorted_x = jax.lax.with_sharding_constraint(d_sorted_x, NamedSharding(mesh, ep3_spec))
-        d_recv_w_total = jax.lax.with_sharding_constraint(
-            d_recv_w_total, NamedSharding(mesh, ep2_spec)
-        )
-        d_x_from_dispatch, d_topk_w = tex.ep_dispatch_bwd(
-            ctx.cfg,
-            ctx.handle_mem,
-            d_sorted_x,
-            d_recv_w_total,
-            num_local_tokens=(B, S),
-            out_partition_spec=out_partition_spec,
-        )
 
         if router is None:
             # Caller-supplied routing: d_topk_w is the routing-weights cotangent, and
@@ -2083,12 +2162,233 @@ def _moe_aux_loss_bwd(ctx, d_aux_loss, K, num_experts, mesh, ep2_spec):
     )
 
 
+
+# =============================================================================
+# EP/GEMM overlap (FusedMoE) path
+# =============================================================================
+#
+# With ``enable_ep_overlap=True`` and an eligible layer, dispatch -> FC1 -> SwiGLU -> FC2 ->
+# combine runs as two fused calls per pass (ep_gemm.h): NCCL EP dispatch overlapped with FC1 +
+# SwiGLU, and FC2 overlapped with the combine; the backward mirrors them and computes both weight
+# gradients beside the EP calls. Routing, aux loss and the gate stay exactly as in the unfused
+# path. The routing weights are applied in FC1's epilogue (act = silu(gate) * up * prob) rather
+# than to FC2's output, so outputs match the unfused path within BF16 rounding, not bitwise.
+
+_EP_OVERLAP_SM_ARCHS = (100, 103, 107)
+
+
+def _ep_overlap_rejection_reasons(
+    x,
+    router_info,
+    wi,
+    wi_0_bias,
+    wi_1_bias,
+    wo_bias,
+    quantizer_sets,
+    dispatch_quantizer,
+    *,
+    num_experts,
+    activation_type,
+    mesh_resource,
+    quant_before_fsdp_ag,
+    recv_capacity_per_rank,
+    use_cudnn_fusion,
+    checkpoint_names,
+) -> list:
+    """Reasons this call cannot use the EP/GEMM overlap path (empty when it can)."""
+    from transformer_engine_jax import get_device_compute_capability
+
+    reasons = []
+    if not tex_ep_overlap.ep_overlap_built():
+        reasons.append("the TE JAX extension was built without the EP overlap FFI")
+    env_reason = tex_ep_overlap.ep_overlap_env_reason()
+    if env_reason is not None:
+        reasons.append(env_reason)
+    try:
+        capability = get_device_compute_capability(0)
+        if capability not in _EP_OVERLAP_SM_ARCHS:
+            reasons.append(f"needs SM 10.0, 10.3 or 10.7, got SM{capability}")
+    except RuntimeError as exc:
+        reasons.append(f"could not query GPU compute capability: {exc}")
+    if os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1") == "0":
+        reasons.append(
+            "deterministic execution was requested, and the routing-weight gradient is reduced"
+            " with atomics"
+        )
+    if x.dtype != jnp.bfloat16:
+        reasons.append(f"needs BF16 activations, got {x.dtype}")
+    if wi.dtype != jnp.bfloat16:
+        reasons.append(f"needs BF16 weights, got {wi.dtype}")
+    if any(b is not None for b in (wi_0_bias, wi_1_bias, wo_bias)):
+        reasons.append("biases are not supported")
+    if str(activation_type).lower() != "silu":
+        reasons.append("needs activation_type='silu' (SwiGLU)")
+    if dispatch_quantizer is not None:
+        reasons.append("quantized (MXFP8) dispatch is not supported yet")
+    for qs in quantizer_sets:
+        if any(q is not None for q in (qs.x, qs.kernel, qs.dgrad)):
+            reasons.append("quantized grouped GEMMs (MXFP8) are not supported yet")
+            break
+    if quant_before_fsdp_ag:
+        reasons.append("quant_before_fsdp_ag is not supported")
+    if any(n is not None for n in checkpoint_names):
+        reasons.append("checkpoint names are not supported")
+    hidden = x.shape[-1]
+    if hidden % 256:
+        reasons.append(f"hidden_dim must be a multiple of 256, got {hidden}")
+    ffn = wo_ffn = None
+    if wi.ndim == 3:
+        ffn = (wi.shape[2] if wi.shape[1] == hidden else wi.shape[1]) // 2
+    if ffn is None or ffn % 64:
+        reasons.append(f"ffn_hidden_size must be a multiple of 64, got {ffn}")
+    del wo_ffn
+    alignment = _CUDNN_JAX_ALIGN_SIZE if use_cudnn_fusion else _ALIGN_SIZE
+    if recv_capacity_per_rank is not None and int(recv_capacity_per_rank) % 256:
+        reasons.append(
+            f"recv_capacity_per_rank must be a multiple of 256, got {recv_capacity_per_rank}"
+        )
+    if alignment not in (64, 128, 256):
+        reasons.append("the EP alignment must be one of (64, 128, 256)")
+    ep_axis = mesh_resource.ep_resource
+    mesh = _get_mesh()
+    if mesh is None or mesh.empty or ep_axis not in mesh.shape:
+        reasons.append("needs an active mesh with the EP axis")
+    elif num_experts % mesh.shape[ep_axis]:
+        reasons.append("num_experts must be divisible by the EP size")
+    try:
+        from .ep import ep_overlap_comm_sms, ep_overlap_num_topk
+
+        if ep_overlap_num_topk() != _num_experts_per_tok(router_info):
+            reasons.append(
+                "ep_bootstrap(num_topk=...) must equal the layer's top-k"
+                f" ({_num_experts_per_tok(router_info)}), got {ep_overlap_num_topk()}: NCCL EP"
+                " needs it for the pull-push flow whose readiness signals the GEMMs follow"
+            )
+        if ep_overlap_comm_sms() <= 0:
+            reasons.append(
+                "ep_bootstrap ran without communication SMs for the overlap; pass max_num_sms > 0"
+                " or set NVTE_ENABLE_CUTEDSL_BACKEND=1 and NVTE_MOE_OVERLAP before ep_bootstrap"
+            )
+    except RuntimeError as exc:
+        reasons.append(str(exc))
+    return reasons
+
+
+def _ep_overlap_fc1_weight(wi, native_layout):
+    """FC1 weights as the overlap GEMM reads them: [E, 2F, H], gate/up in 32-row blocks."""
+    if native_layout:
+        return wi
+    gate, up = jnp.split(wi, 2, axis=-1)
+    return tex.pack_gated_activation_pair(gate, up).transpose(0, 2, 1)
+
+
+def _ep_overlap_fc1_weight_grad(d_w1, native_layout):
+    """Inverse layout map of :func:`_ep_overlap_fc1_weight` for the weight gradient."""
+    if native_layout:
+        return d_w1
+    gate, up = tex.unpack_gated_activation_pair(d_w1.transpose(0, 2, 1))
+    return jnp.concatenate((gate, up), axis=-1)
+
+
+def _ep_overlap_fwd(
+    x, topk_idx_3d, topk_w_3d, wi, wo, *, mesh, batch_axes, ep_axis, cfg, recv_pr,
+    native_layout,
+):
+    """Overlapped dispatch/FC1/SwiGLU/FC2/combine. Returns (output [B,S,H], total_recv_tokens,
+    recv_topk_weights, handle_mem, residuals)."""
+    from jax.experimental.shard_map import shard_map
+
+    B, S, H = x.shape
+    K = cfg.top_k
+    align = cfg.dispatch_output_per_expert_alignment
+    w1 = _ep_overlap_fc1_weight(wi, native_layout)
+    w2 = wo.transpose(0, 2, 1)
+    tok = P(batch_axes, None, None)
+    row = P(batch_axes)
+    row2 = P(batch_axes, None)
+    kspec = P(ep_axis, None, None)
+
+    def body(x_l, idx_l, w_l, w1_l, w2_l):
+        T = x_l.shape[0] * x_l.shape[1]
+        tokens = x_l.reshape(T, H)
+        idx = idx_l.reshape(T, K).astype(jnp.int32)
+        tw = w_l.reshape(T, K).astype(jnp.float32)
+        recv_tokens, recv_w, gemm_out, act_out, counts, offsets, handle_mem = (
+            tex_ep_overlap.ep_dispatch_gemm_fwd(
+                idx, tokens, tw, w1_l, recv_capacity=recv_pr, alignment=align
+            )
+        )
+        out = tex_ep_overlap.ep_combine_gemm_fwd(
+            handle_mem, act_out, offsets, w2_l, num_tokens=T, top_k=K, alignment=align
+        )
+        total = offsets[-1:]
+        return (
+            out.reshape(x_l.shape),
+            total,
+            recv_w,
+            handle_mem,
+            (recv_tokens, gemm_out, act_out, counts),
+        )
+
+    out, total, recv_w, handle_mem, res = shard_map(
+        body,
+        mesh=mesh,
+        in_specs=(tok, tok, tok, kspec, kspec),
+        out_specs=(tok, row, row, row, (row2, row2, row2, row)),
+        check_rep=False,
+    )(x, topk_idx_3d, topk_w_3d, w1, w2)
+    total = total.reshape(-1, 1)
+    return out, total, recv_w, handle_mem, (*res, w1, w2)
+
+
+def _ep_overlap_bwd(
+    d_output, handle_mem, recv_w, residuals, *, mesh, batch_axes, ep_axis, dp_axes, cfg,
+    native_layout,
+):
+    """Backward of :func:`_ep_overlap_fwd`. Returns (d_x, d_topk_w [B*S... ,K], d_wi, d_wo)."""
+    from jax.experimental.shard_map import shard_map
+
+    recv_tokens, gemm_out, act_out, counts, w1, w2 = residuals
+    B, S, H = d_output.shape
+    K = cfg.top_k
+    align = cfg.dispatch_output_per_expert_alignment
+    tok = P(batch_axes, None, None)
+    row = P(batch_axes)
+    row2 = P(batch_axes, None)
+    kspec = P(ep_axis, None, None)
+
+    def body(dy_l, hm, rw, rt, go, ao, cnt, w1_l, w2_l):
+        T = dy_l.shape[0] * dy_l.shape[1]
+        dy = dy_l.reshape(T, H)
+        grad_gemm_out, grad_recv_w, d_w2 = tex_ep_overlap.ep_combine_gemm_bwd(
+            hm, dy, go, rw, cnt, w2_l, ao, top_k=K, alignment=align
+        )
+        grad_tokens, grad_topk, d_w1 = tex_ep_overlap.ep_dispatch_gemm_bwd(
+            hm, grad_gemm_out, grad_recv_w, cnt, w1_l, rt, num_tokens=T, top_k=K, alignment=align
+        )
+        if dp_axes:
+            d_w1 = jax.lax.psum(d_w1, axis_name=dp_axes)
+            d_w2 = jax.lax.psum(d_w2, axis_name=dp_axes)
+        return grad_tokens.reshape(dy_l.shape), grad_topk.reshape(*dy_l.shape[:2], K), d_w1, d_w2
+
+    d_x, d_topk_w, d_w1, d_w2 = shard_map(
+        body,
+        mesh=mesh,
+        in_specs=(tok, row, row, row2, row2, row2, row, kspec, kspec),
+        out_specs=(tok, tok, kspec, kspec),
+        check_rep=False,
+    )(d_output, handle_mem, recv_w, recv_tokens, gemm_out, act_out, counts, w1, w2)
+    d_wi = _ep_overlap_fc1_weight_grad(d_w1, native_layout)
+    d_wo = d_w2.transpose(0, 2, 1)
+    return d_x, d_topk_w, d_wi, d_wo
+
+
 # =============================================================================
 # custom_vjp + public entry
 # =============================================================================
 
 
-@partial(jax.custom_vjp, nondiff_argnums=tuple(range(9, 27)))
+@partial(jax.custom_vjp, nondiff_argnums=tuple(range(9, 28)))
 def _moe(
     x,
     router_info,
@@ -2117,6 +2417,7 @@ def _moe(
     quant_before_fsdp_ag,
     use_cudnn_fusion: bool = True,
     cudnn_native_weight_layout: Optional[bool] = None,
+    use_ep_overlap: bool = False,
 ):
     primal, _ = _moe_fwd_rule(
         x,
@@ -2146,6 +2447,7 @@ def _moe(
         quant_before_fsdp_ag,
         use_cudnn_fusion,
         cudnn_native_weight_layout,
+        use_ep_overlap,
     )
     return primal
 
@@ -2184,6 +2486,7 @@ def moe(
     use_cudnn_fusion: bool = True,
     cudnn_native_weight_layout: Optional[bool] = None,
     dispatch_quantizer: Optional[Quantizer] = None,
+    enable_ep_overlap: bool = False,
 ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray, jnp.ndarray]:
     """Run a full MoE block under a single fused custom_vjp on the TE EP path.
 
@@ -2281,6 +2584,11 @@ def moe(
     resolved through the active Flax rules. The selected MeshResource is also used by internal TE sharding
     in both forward and backward, independently of an enclosing global context.
 
+    ``enable_ep_overlap=True`` runs dispatch -> FC1 -> SwiGLU -> FC2 -> combine (and the backward)
+    as NCCL EP calls overlapped with CuTeDSL grouped GEMMs (needs NVTE_ENABLE_CUTEDSL_BACKEND=1,
+    NVTE_MOE_OVERLAP, BF16, SwiGLU, no biases, hidden % 256 == 0, FFN % 64 == 0). Ineligible calls
+    warn and run the regular path.
+
     See module docstring for the rest of the parameter semantics and the
     surrounding design rationale.
     """
@@ -2347,6 +2655,41 @@ def moe(
             )
             use_cudnn_jax_fusion = _select_cudnn_jax_fusion(rejection_reasons)
 
+        use_ep_overlap = False
+        if enable_ep_overlap:
+            overlap_reasons = _ep_overlap_rejection_reasons(
+                x,
+                router_info,
+                wi,
+                wi_0_bias,
+                wi_1_bias,
+                wo_bias,
+                quantizer_sets,
+                dispatch_quantizer,
+                num_experts=num_experts,
+                activation_type=activation_type,
+                mesh_resource=mesh_resource,
+                quant_before_fsdp_ag=quant_before_fsdp_ag,
+                recv_capacity_per_rank=recv_capacity_per_rank,
+                use_cudnn_fusion=use_cudnn_fusion,
+                checkpoint_names=(
+                    wi_0_checkpoint_name,
+                    wi_1_checkpoint_name,
+                    wo_checkpoint_name,
+                    dispatch_checkpoint_name,
+                ),
+            )
+            if overlap_reasons:
+                warnings.warn(
+                    "enable_ep_overlap=True: EP overlap skipped, running the non-overlapped TE EP"
+                    " MoE path: " + "; ".join(overlap_reasons),
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                use_ep_overlap = True
+                use_cudnn_jax_fusion = False
+
         output, aux_loss, total_recv_tokens, expert_counts = _moe(
             x,
             router_info,
@@ -2375,6 +2718,7 @@ def moe(
             quant_before_fsdp_ag,
             use_cudnn_fusion,
             cudnn_native_weight_layout,
+            use_ep_overlap,
         )
         if not has_aux_loss:
             aux_loss = None

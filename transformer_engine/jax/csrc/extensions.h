@@ -215,13 +215,17 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedMoEAuxLossBackwardHandler);
 void SetEpBootstrapParams(pybind11::bytes unique_id_bytes, int ep_size, int rank_within_group,
                           int num_experts, int max_tokens_per_rank, int max_recv_tokens_per_rank,
                           int hidden_dim, int max_num_sms, int max_token_dtype,
-                          bool drop_on_overflow, bool borrowed_comm);
+                          bool drop_on_overflow, bool borrowed_comm, int num_topk);
 void ReleaseEpResources();
 // Atexit-safe variant of ReleaseEpResources; never shuts down a borrowed
 // backend (see definition).
 void ReleaseEpResourcesAtExit();
 // Return the handle_mem byte size for a layer config.
 size_t EpHandleMemSize(int top_k, size_t dispatch_output_per_expert_alignment);
+// Workspace bytes for the EP/GEMM overlap calls (ep_gemm.h); compiles the group's GEMMs.
+size_t EpOverlapWorkspaceSize(size_t hidden_dim, size_t ffn_dim, size_t num_local_experts,
+                              size_t recv_capacity, bool with_weight_grad, bool mxfp8, int top_k,
+                              size_t dispatch_output_per_expert_alignment, int topk_idx_dtype);
 
 // EpInstanceState type_id / type_info capsules for jax.ffi.register_ffi_type.
 pybind11::capsule GetEpInstanceStateTypeIdCapsule();
@@ -235,6 +239,10 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(EpPrepareAndDispatchHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchBwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineBwdHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmFwdHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmFwdHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmBwdHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmBwdHandler);
 
 // EP-specific execute stage of the borrowed-comm bootstrap op (see
 // tex.ep.use_nccl_comm_from_xla). The prepare stage is the generic

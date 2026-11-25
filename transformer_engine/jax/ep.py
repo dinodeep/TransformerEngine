@@ -40,6 +40,33 @@ __all__ = [
 
 _atexit_registered = False
 
+# Communication SMs the EP/GEMM overlap path gives each NCCL EP call (PyTorch uses the same 24).
+_OVERLAP_COMM_SMS = 24
+# num_comm_sms of the bootstrapped group; the overlap path needs it > 0. None before bootstrap.
+_bootstrap_comm_sms = None
+# num_topk of the bootstrapped group (0 = unset; the overlap path needs the layer's top-k).
+_bootstrap_num_topk = 0
+
+
+def ep_overlap_num_topk() -> int:
+    """num_topk the EP group was bootstrapped with (0 = unset)."""
+    return _bootstrap_num_topk
+
+
+def ep_overlap_comm_sms() -> int:
+    """Communication SMs of the bootstrapped EP group (0: the overlap path cannot run)."""
+    if _bootstrap_comm_sms is None:
+        raise RuntimeError("EP overlap needs ep_bootstrap() first.")
+    return _bootstrap_comm_sms
+
+
+def _overlap_requested_by_env() -> bool:
+    import os
+
+    return os.environ.get("NVTE_ENABLE_CUTEDSL_BACKEND", "0") == "1" and bool(
+        os.environ.get("NVTE_MOE_OVERLAP")
+    )
+
 
 def _allgather_uid(uid_arr, world_size, uid_size):
     """Allgather UID bytes across all processes.
@@ -125,6 +152,7 @@ def ep_bootstrap(
     max_token_dtype=jnp.bfloat16,
     max_num_sms=0,
     drop_on_overflow=False,
+    num_topk=0,
 ):
     """Initialize the EP communicator. Call once per process before any EP op.
 
@@ -148,13 +176,24 @@ def ep_bootstrap(
             at least ep_size * max_tokens_per_rank * top_k to avoid drops.
         hidden_dim: Feature dimension of token tensors passed to ep_dispatch.
         max_token_dtype: Widest dtype the group will dispatch (only bfloat16 supported).
-        max_num_sms: SM budget for the dispatch/combine kernels; 0 = default (32).
+        max_num_sms: SM budget for the dispatch/combine kernels; 0 = default (32), or 24 when
+            NVTE_ENABLE_CUTEDSL_BACKEND=1 and NVTE_MOE_OVERLAP are set (the EP/GEMM overlap
+            path needs an explicit budget).
         drop_on_overflow: Drop tokens exceeding recv_capacity_per_rank instead of
             trapping on overflow. Dropped tokens are still counted in
             total_recv_tokens, so callers can detect overflow from it.
+        num_topk: Per-token top-k of the layers using this group; 0 = unset. Required by the
+            MoE block's EP/GEMM overlap path (``enable_ep_overlap``): it lets NCCL EP select the
+            HT pull-push flow whose readiness signals the overlapped GEMMs follow.
     """
     if rank is None:
         rank = jax.process_index()
+    global _bootstrap_comm_sms, _bootstrap_num_topk
+    _bootstrap_num_topk = int(num_topk)
+    if int(max_num_sms) == 0 and _overlap_requested_by_env():
+        # The EP/GEMM overlap kernels need an explicit SM split between NCCL EP and the GEMMs.
+        max_num_sms = _OVERLAP_COMM_SMS
+    _bootstrap_comm_sms = int(max_num_sms)
     if jnp.dtype(max_token_dtype) != jnp.bfloat16:
         raise NotImplementedError(
             "ep_bootstrap: only max_token_dtype=jnp.bfloat16 is supported today, got"
@@ -230,6 +269,7 @@ def ep_bootstrap(
             max_token_dtype=int(jax_dtype_to_te_dtype(max_token_dtype)),
             drop_on_overflow=bool(drop_on_overflow),
             borrowed_comm=True,
+            num_topk=int(num_topk),
         )
         tex.ep.set_ep_config(tex.ep.EpConfig(**common_cfg))
         # Initialize EPBackend now so trace-time handle_mem_size finds it ready.
@@ -264,6 +304,7 @@ def ep_bootstrap(
         max_num_sms=int(max_num_sms),
         max_token_dtype=int(jax_dtype_to_te_dtype(max_token_dtype)),
         drop_on_overflow=bool(drop_on_overflow),
+        num_topk=int(num_topk),
     )
 
     # Release the C++ anchor at interpreter shutdown so RAII can tear down NCCL.
@@ -293,7 +334,9 @@ def ep_finalize():
     Reinitialization must use the same communicator mode; switching modes
     requires a process restart.
     """
+    global _bootstrap_comm_sms
     jax.clear_caches()
+    _bootstrap_comm_sms = None
     transformer_engine_jax.release_ep_resources()
     tex.ep.reset_ep_config()
 
