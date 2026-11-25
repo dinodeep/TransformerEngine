@@ -1616,6 +1616,7 @@ def _moe_fwd_rule(
                 native_layout=cudnn_native_weight_layout,
                 fc2_native_layout=use_ep_overlap == _EP_OVERLAP_FC2_NATIVE,
                 mxfp8=_ep_overlap_recipe(quantizer_sets, dispatch_quantizer)[0],
+                quantizer_sets=quantizer_sets,
                 quant_gather_axis=(
                     _ep_overlap_quant_gather_axis(mesh_resource, wi_kernel_axes, wo_kernel_axes)
                     if quant_before_fsdp_ag
@@ -2343,31 +2344,18 @@ def _ep_overlap_mxfp8_rows(x):
     )
 
 
-def _ep_overlap_mxfp8_weight_2x(w):
-    """Rowwise and columnwise grouped MXFP8 of [E, m, n] in one pass: (row data, row scales,
-    col data, col scales), data [E, m, n] E4M3, scales flat GEMM-swizzled E * m * n / 32."""
-    E, m, n = w.shape
-    q = QuantizerFactory.create(
-        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
-        q_dtype=jnp.float8_e4m3fn,
-        q_layout=QuantizeLayout.ROWWISE_COLWISE,
-        n_groups=E,
-    )
-    t = tex.grouped_quantize(w, q, flatten_axis=-1)
-    count = E * m * n // 32
-    r, c = t.rowwise_tensor, t.colwise_tensor
+def _ep_overlap_mxfp8_operands(casted, shape):
+    """(row data, row scales, col data, col scales) of a grouped rowwise+columnwise MXFP8 weight
+    [E, m, n] as the overlap calls take them: E4M3 data [E, m, n], flat GEMM-swizzled scales of
+    E * m * n / 32 (the grouped allocation's padding tail is dropped)."""
+    count = math.prod(shape) // 32
+    r, c = casted.rowwise_tensor, casted.colwise_tensor
     return (
-        r.data.reshape(E, m, n),
+        r.data.reshape(shape),
         r.scale_inv.reshape(-1)[:count],
-        c.data.reshape(E, m, n),
+        c.data.reshape(shape),
         c.scale_inv.reshape(-1)[:count],
     )
-
-
-def _ep_overlap_gather_experts(arrays, fsdp_axis):
-    """All-gather per-expert MXFP8 data [E_loc, m, n] and flat swizzled scales (whole experts,
-    contiguous per expert) along the expert axis over fsdp_axis (quantize-before-gather)."""
-    return tuple(jax.lax.all_gather(a, fsdp_axis, axis=0, tiled=True) for a in arrays)
 
 
 def _ep_overlap_fc1_weight(wi, native_layout):
@@ -2401,12 +2389,14 @@ def _ep_overlap_fwd(
     native_layout,
     fc2_native_layout=False,
     mxfp8=False,
+    quantizer_sets=None,
     quant_gather_axis=None,
 ):
-    """Overlapped dispatch/FC1/SwiGLU/FC2/combine. With MXFP8 and ``quant_gather_axis`` (the
-    FSDP axis, sharding the expert dimension together with EP), the weights enter as their local
-    shards, are quantized there and gathered as MXFP8 (quantize before the FSDP all-gather). Returns (output [B,S,H], total_recv_tokens,
-    recv_topk_weights, handle_mem, residuals)."""
+    """Overlapped dispatch/FC1/SwiGLU/FC2/combine. MXFP8 quantizes the weights with the FC1/FC2
+    kernel quantizers of ``quantizer_sets`` (rowwise and columnwise). With ``quant_gather_axis``
+    (the FSDP axis, sharding the expert dimension together with EP), the weights enter as their
+    local shards, are quantized there and gathered as MXFP8 (``_gather_quantized_weight``).
+    Returns (output [B,S,H], total_recv_tokens, recv_topk_weights, handle_mem, residuals)."""
     from jax.experimental.shard_map import shard_map
 
     H = x.shape[-1]
@@ -2426,12 +2416,27 @@ def _ep_overlap_fwd(
         tw = w_l.reshape(T, K).astype(jnp.float32)
         if mxfp8:
             tok_q, tok_s = _ep_overlap_mxfp8_rows(tokens)
-            w1_q, w1_s, w1_c, w1_cs = _ep_overlap_mxfp8_weight_2x(w1_l)
-            w2_q, w2_s, w2_c, w2_cs = _ep_overlap_mxfp8_weight_2x(w2_l)
+            fsdp_size = mesh.shape[quant_gather_axis] if quant_gather_axis is not None else 1
+            casted_w1 = _prepare_fc1_weight(
+                w1_l,
+                quantizer_sets[0].kernel,
+                fused=True,
+                native_layout=True,
+                quant_before_fsdp_ag=quant_gather_axis is not None,
+                fsdp_axis=quant_gather_axis,
+                fsdp_size=fsdp_size,
+                sharded_axis=0 if quant_gather_axis is not None else None,
+            )
+            casted_w2 = tex.grouped_quantize(w2_l, quantizer_sets[1].kernel, flatten_axis=-1)
             if quant_gather_axis is not None:
-                w1_q, w1_s, w1_c, w1_cs, w2_q, w2_s, w2_c, w2_cs = _ep_overlap_gather_experts(
-                    (w1_q, w1_s, w1_c, w1_cs, w2_q, w2_s, w2_c, w2_cs), quant_gather_axis
-                )
+                casted_w2 = _gather_quantized_weight(casted_w2, quant_gather_axis, fsdp_size, 0)
+            E_loc = w1_l.shape[0] * fsdp_size
+            w1_q, w1_s, w1_c, w1_cs = _ep_overlap_mxfp8_operands(
+                casted_w1, (E_loc,) + tuple(w1_l.shape[1:])
+            )
+            w2_q, w2_s, w2_c, w2_cs = _ep_overlap_mxfp8_operands(
+                casted_w2, (E_loc,) + tuple(w2_l.shape[1:])
+            )
             # The backward reads both weights columnwise: keep those as the weight residuals.
             weight_res = (w1_c, w1_cs, w2_c, w2_cs)
             (
