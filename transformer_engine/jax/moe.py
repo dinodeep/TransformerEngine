@@ -1602,21 +1602,19 @@ def _moe_fwd_rule(
                 dispatch_output_per_expert_alignment=dispatch_alignment,
                 topk_idx_dtype=int(jax_dtype_to_te_dtype(topk_idx_3d.dtype)),
             )
-            output, total_recv_tokens, recv_topk_weights, handle_mem, overlap_res = (
-                _ep_overlap_fwd(
-                    x,
-                    topk_idx_3d,
-                    topk_w_3d,
-                    wi,
-                    wo,
-                    mesh=mesh,
-                    batch_axes=batch_pspec_axis,
-                    ep_axis=ep_axis,
-                    cfg=cfg,
-                    recv_pr=recv_pr,
-                    native_layout=cudnn_native_weight_layout,
-                    fc2_native_layout=use_ep_overlap == _EP_OVERLAP_FC2_NATIVE,
-                )
+            output, total_recv_tokens, recv_topk_weights, handle_mem, overlap_res = _ep_overlap_fwd(
+                x,
+                topk_idx_3d,
+                topk_w_3d,
+                wi,
+                wo,
+                mesh=mesh,
+                batch_axes=batch_pspec_axis,
+                ep_axis=ep_axis,
+                cfg=cfg,
+                recv_pr=recv_pr,
+                native_layout=cudnn_native_weight_layout,
+                fc2_native_layout=use_ep_overlap == _EP_OVERLAP_FC2_NATIVE,
             )
             output = with_sharding_constraint_by_logical_axes(output, input_axes)
             ctx = _Ctx(
@@ -2165,7 +2163,6 @@ def _moe_aux_loss_bwd(ctx, d_aux_loss, K, num_experts, mesh, ep2_spec):
     )
 
 
-
 # =============================================================================
 # EP/GEMM overlap (FusedMoE) path
 # =============================================================================
@@ -2297,14 +2294,25 @@ def _ep_overlap_fc1_weight_grad(d_w1, native_layout):
 
 
 def _ep_overlap_fwd(
-    x, topk_idx_3d, topk_w_3d, wi, wo, *, mesh, batch_axes, ep_axis, cfg, recv_pr,
-    native_layout, fc2_native_layout=False,
+    x,
+    topk_idx_3d,
+    topk_w_3d,
+    wi,
+    wo,
+    *,
+    mesh,
+    batch_axes,
+    ep_axis,
+    cfg,
+    recv_pr,
+    native_layout,
+    fc2_native_layout=False,
 ):
     """Overlapped dispatch/FC1/SwiGLU/FC2/combine. Returns (output [B,S,H], total_recv_tokens,
     recv_topk_weights, handle_mem, residuals)."""
     from jax.experimental.shard_map import shard_map
 
-    B, S, H = x.shape
+    H = x.shape[-1]
     K = cfg.top_k
     align = cfg.dispatch_output_per_expert_alignment
     w1 = _ep_overlap_fc1_weight(wi, native_layout)
@@ -2348,14 +2356,24 @@ def _ep_overlap_fwd(
 
 
 def _ep_overlap_bwd(
-    d_output, handle_mem, recv_w, residuals, *, mesh, batch_axes, ep_axis, dp_axes, cfg,
-    native_layout, fc2_native_layout=False,
+    d_output,
+    handle_mem,
+    recv_w,
+    residuals,
+    *,
+    mesh,
+    batch_axes,
+    ep_axis,
+    dp_axes,
+    cfg,
+    native_layout,
+    fc2_native_layout=False,
 ):
     """Backward of :func:`_ep_overlap_fwd`. Returns (d_x, d_topk_w [B*S... ,K], d_wi, d_wo)."""
     from jax.experimental.shard_map import shard_map
 
     recv_tokens, gemm_out, act_out, counts, w1, w2 = residuals
-    B, S, H = d_output.shape
+    H = d_output.shape[-1]
     K = cfg.top_k
     align = cfg.dispatch_output_per_expert_alignment
     tok = P(batch_axes, None, None)
@@ -2703,7 +2721,8 @@ def moe(
             if overlap_reasons:
                 warnings.warn(
                     "enable_ep_overlap=True: EP overlap skipped, running the non-overlapped TE EP"
-                    " MoE path: " + "; ".join(overlap_reasons),
+                    " MoE path: "
+                    + "; ".join(overlap_reasons),
                     UserWarning,
                     stacklevel=2,
                 )

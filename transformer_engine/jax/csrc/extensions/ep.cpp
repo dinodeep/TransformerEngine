@@ -7,7 +7,6 @@
 #ifdef NVTE_WITH_NCCL_EP
 
 #include "transformer_engine/ep.h"
-#include "transformer_engine/ep_gemm.h"
 
 #include <nccl.h>
 
@@ -24,6 +23,7 @@
 #include "../extensions.h"
 #include "common.h"
 #include "ffi_collectives.h"
+#include "transformer_engine/ep_gemm.h"
 #include "transformer_engine/gemm.h"
 
 namespace transformer_engine {
@@ -820,23 +820,22 @@ Error_Type EpDispatchGemmFwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
     auto topk_weights_ = WrapArg(topk_weights);
     auto weight_ = WrapArg(weight, false);
     auto recv_tokens_ = WrapRet(recv_tokens);
-    auto recv_w_ = TensorWrapper(recv_topk_weights->untyped_data(),
-                                 std::vector<size_t>{recv_topk_weights->element_count()},
-                                 DType::kFloat32);
+    auto recv_w_ =
+        TensorWrapper(recv_topk_weights->untyped_data(),
+                      std::vector<size_t>{recv_topk_weights->element_count()}, DType::kFloat32);
     auto gemm_out_ = WrapRet(gemm_out);
     auto act_out_ = WrapRet(act_out);
-    auto counts_ = TensorWrapper(recv_tokens_per_expert->untyped_data(),
-                                 std::vector<size_t>{recv_tokens_per_expert->element_count()},
-                                 DType::kInt32);
-    auto offsets_ = WrapOffsets(expert_token_offsets->untyped_data(),
-                                expert_token_offsets->element_count());
+    auto counts_ =
+        TensorWrapper(recv_tokens_per_expert->untyped_data(),
+                      std::vector<size_t>{recv_tokens_per_expert->element_count()}, DType::kInt32);
+    auto offsets_ =
+        WrapOffsets(expert_token_offsets->untyped_data(), expert_token_offsets->element_count());
     auto handle_mem_ = WrapBytes(handle_mem->untyped_data(), handle_mem->size_bytes());
     auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
-    nvte_ep_dispatch_gemm_fwd(handle_mem_.data(), topk_idx_.data(), tokens_.data(),
-                              NVTECommWindow{nullptr, 0}, topk_weights_.data(), weight_.data(),
-                              recv_tokens_.data(), recv_w_.data(), gemm_out_.data(),
-                              act_out_.data(), counts_.data(), offsets_.data(), nullptr,
-                              ws_.data(), &layer_cfg, stream);
+    nvte_ep_dispatch_gemm_fwd(
+        handle_mem_.data(), topk_idx_.data(), tokens_.data(), NVTECommWindow{nullptr, 0},
+        topk_weights_.data(), weight_.data(), recv_tokens_.data(), recv_w_.data(), gemm_out_.data(),
+        act_out_.data(), counts_.data(), offsets_.data(), nullptr, ws_.data(), &layer_cfg, stream);
   });
 }
 
@@ -911,12 +910,12 @@ Error_Type EpCombineGemmBwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
     auto handle_mem_ = WrapBytes(handle_mem.untyped_data(), handle_mem.size_bytes());
     auto grad_result_ = WrapArg(grad_result);
     auto gemm_out_ = WrapArg(gemm_out);
-    auto recv_w_ = TensorWrapper(recv_topk_weights.untyped_data(),
-                                 std::vector<size_t>{recv_topk_weights.element_count()},
-                                 DType::kFloat32);
-    auto counts_ = TensorWrapper(recv_tokens_per_expert.untyped_data(),
-                                 std::vector<size_t>{recv_tokens_per_expert.element_count()},
-                                 DType::kInt32);
+    auto recv_w_ =
+        TensorWrapper(recv_topk_weights.untyped_data(),
+                      std::vector<size_t>{recv_topk_weights.element_count()}, DType::kFloat32);
+    auto counts_ =
+        TensorWrapper(recv_tokens_per_expert.untyped_data(),
+                      std::vector<size_t>{recv_tokens_per_expert.element_count()}, DType::kInt32);
     auto weight_ = WrapArg(weight, false);
     auto wgrad_input_ = WrapArg(wgrad_input);
     auto grad_expert_out_ = WrapRet(grad_expert_out);
@@ -928,10 +927,10 @@ Error_Type EpCombineGemmBwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
     auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
     nvte_ep_combine_gemm_bwd(handle_mem_.data(), grad_result_.data(), NVTECommWindow{nullptr, 0},
                              gemm_out_.data(), recv_w_.data(), counts_.data(), weight_.data(),
-                             compute_wgrad ? wgrad_input_.data() : nullptr,
-                             grad_expert_out_.data(), grad_gemm_out_.data(), grad_recv_w_.data(),
-                             nullptr, compute_wgrad ? weight_grad_.data() : nullptr, 0,
-                             ws_.data(), &layer_cfg, stream);
+                             compute_wgrad ? wgrad_input_.data() : nullptr, grad_expert_out_.data(),
+                             grad_gemm_out_.data(), grad_recv_w_.data(), nullptr,
+                             compute_wgrad ? weight_grad_.data() : nullptr, 0, ws_.data(),
+                             &layer_cfg, stream);
   });
 }
 
@@ -968,12 +967,12 @@ Error_Type EpDispatchGemmBwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
   return ffi_guard("EP dispatch_gemm_bwd failed: ", [&] {
     auto handle_mem_ = WrapBytes(handle_mem.untyped_data(), handle_mem.size_bytes());
     auto grad_gemm_out_ = WrapArg(grad_gemm_out);
-    auto grad_recv_w_ = TensorWrapper(grad_recv_topk_weights.untyped_data(),
-                                      std::vector<size_t>{grad_recv_topk_weights.element_count()},
-                                      DType::kFloat32);
-    auto counts_ = TensorWrapper(recv_tokens_per_expert.untyped_data(),
-                                 std::vector<size_t>{recv_tokens_per_expert.element_count()},
-                                 DType::kInt32);
+    auto grad_recv_w_ =
+        TensorWrapper(grad_recv_topk_weights.untyped_data(),
+                      std::vector<size_t>{grad_recv_topk_weights.element_count()}, DType::kFloat32);
+    auto counts_ =
+        TensorWrapper(recv_tokens_per_expert.untyped_data(),
+                      std::vector<size_t>{recv_tokens_per_expert.element_count()}, DType::kInt32);
     auto weight_ = WrapArg(weight, false);
     auto wgrad_input_ = WrapArg(wgrad_input);
     auto grad_recv_tokens_ = WrapRet(grad_recv_tokens);
@@ -981,12 +980,11 @@ Error_Type EpDispatchGemmBwdFFI(cudaStream_t stream, EpInstanceState* ep_state,
     auto grad_topk_ = WrapRet(grad_topk_weights);
     auto weight_grad_ = WrapRet(weight_grad, false);
     auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
-    nvte_ep_dispatch_gemm_bwd(handle_mem_.data(), grad_gemm_out_.data(), grad_recv_w_.data(),
-                              counts_.data(), weight_.data(),
-                              compute_wgrad ? wgrad_input_.data() : nullptr,
-                              grad_recv_tokens_.data(), grad_tokens_.data(), grad_topk_.data(),
-                              compute_wgrad ? weight_grad_.data() : nullptr, 0, ws_.data(),
-                              &layer_cfg, stream);
+    nvte_ep_dispatch_gemm_bwd(
+        handle_mem_.data(), grad_gemm_out_.data(), grad_recv_w_.data(), counts_.data(),
+        weight_.data(), compute_wgrad ? wgrad_input_.data() : nullptr, grad_recv_tokens_.data(),
+        grad_tokens_.data(), grad_topk_.data(), compute_wgrad ? weight_grad_.data() : nullptr, 0,
+        ws_.data(), &layer_cfg, stream);
   });
 }
 

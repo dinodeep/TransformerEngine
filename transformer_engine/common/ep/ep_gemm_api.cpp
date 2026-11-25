@@ -636,8 +636,9 @@ void nvte_ep_overlap_compile(size_t hidden_dim, size_t ffn_dim, size_t num_local
                                  std::initializer_list<std::tuple<int, bool, size_t>> launches) {
     const size_t routed_rows =
         static_cast<size_t>(ctx.group.max_tokens_per_rank) * ctx.layer_cfg.top_k;
-    const ep::EpWgradConfig base{rows,  m,  n,     ne, 1, fp32_weight_grad != 0, false, false, 0,
-                                 mx, false, ctx.alignment(), routed_rows};
+    const ep::EpWgradConfig base{rows,       m,     n, ne, 1,     fp32_weight_grad != 0,
+                                 false,      false, 0, mx, false, ctx.alignment(),
+                                 routed_rows};
     NVTE_CHECK(base.workspace_layout().has_value(),
                "cannot query the weight-gradient workspace layout");
     for (const auto& [clusters, wait_primary_at_start, ready_slot_rows] : launches) {

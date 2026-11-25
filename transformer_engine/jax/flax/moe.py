@@ -269,18 +269,22 @@ class _MoEBlock(TransformerEngineBase):
         # Native layouts initialize in the default layout, then permute, so values match it.
         if self.cudnn_native_weight_layout:
 
-            def wi_init(key, shape, dtype, _init=self.kernel_init, _shape=wi_shape):
+            def native_wi_init(key, shape, dtype, _init=self.kernel_init, _shape=wi_shape):
                 del shape
                 gate, up = jnp.split(_init(key, _shape, dtype), 2, axis=-1)
                 return pack_gated_activation_pair(gate, up).transpose(0, 2, 1)
+
+            wi_init = native_wi_init
 
             wi_shape = (wi_shape[0], wi_shape[2], wi_shape[1])
             wi_kernel_axes = (wi_kernel_axes[0], wi_kernel_axes[2], wi_kernel_axes[1])
         if self.fc2_native_weight_layout:
 
-            def wo_init(key, shape, dtype, _init=self.kernel_init, _shape=wo_shape):
+            def native_wo_init(key, shape, dtype, _init=self.kernel_init, _shape=wo_shape):
                 del shape
                 return _init(key, _shape, dtype).transpose(0, 2, 1)
+
+            wo_init = native_wo_init
 
             wo_shape = (wo_shape[0], wo_shape[2], wo_shape[1])
             wo_kernel_axes = (wo_kernel_axes[0], wo_kernel_axes[2], wo_kernel_axes[1])

@@ -56,7 +56,9 @@ from transformer_engine_jax import get_device_compute_capability  # noqa: E402
 
 if get_device_compute_capability(0) not in (100, 103, 107):
     pytest.skip("EP overlap needs SM 10.0, 10.3 or 10.7", allow_module_level=True)
-if not (os.environ.get("NVTE_ENABLE_CUTEDSL_BACKEND") == "1" and os.environ.get("NVTE_MOE_OVERLAP")):
+if not (
+    os.environ.get("NVTE_ENABLE_CUTEDSL_BACKEND") == "1" and os.environ.get("NVTE_MOE_OVERLAP")
+):
     pytest.skip(
         "EP overlap needs NVTE_ENABLE_CUTEDSL_BACKEND=1 and NVTE_MOE_OVERLAP",
         allow_module_level=True,
@@ -114,7 +116,12 @@ def layout(request):
         mesh = Mesh(np.asarray(jax.devices()).reshape(fsdp, ep), ("fsdp", "ep"))
         mr = MeshResource(ep_resource="ep", fsdp_resource="fsdp")
         if fsdp_mode == "expert":
-            rules = (("exp", ("ep", "fsdp")), ("embed", None), ("mlp", None), ("batch", ("fsdp", "ep")))
+            rules = (
+                ("exp", ("ep", "fsdp")),
+                ("embed", None),
+                ("mlp", None),
+                ("batch", ("fsdp", "ep")),
+            )
         else:
             rules = (("exp", "ep"), ("embed", "fsdp"), ("mlp", None), ("batch", ("fsdp", "ep")))
         batch_axes = ("fsdp", "ep")
@@ -327,15 +334,22 @@ def _rel_err(test, ref):
 
 # The expert weight gradients are not bitwise reproducible run to run on either path (flag-off:
 # TE's grouped-GEMM weight gradient; flag-on: the CuTeDSL weight-gradient GEMMs split tiles across
-# two launches), while the output, dx and the gate gradient are. "Bitwise" checks therefore compare
-# expert weight gradients within this bound (max |a - b| / max |b|), measured run-to-run at ~3e-3.
+# two launches), while the output is. With the flag on, the routing-weight gradient is also reduced
+# with float32 atomics (as in PyTorch FusedMoE), so dx (through the gate) and the gate gradient are
+# reproducible only to float32 reduction order, which can flip the last bit of a BF16 value. "Bitwise"
+# checks therefore compare these within bounds (max |a - b| / max |b|): weight gradients measured
+# run-to-run at up to ~3e-3, the routing-dependent BF16 gradients at up to ~3.6e-3 (1 BF16 ulp).
 WGRAD_REPRO_TOL = 1e-2
+ROUTING_GRAD_REPRO_TOL = 1e-2
 
 
-def _assert_same(test, ref, key):
+def _assert_same(test, ref, key, enable=False):
     if key in ("wi", "wo"):
         e = _rel_err(test, ref)
         assert e <= WGRAD_REPRO_TOL, f"{key}: rel err {e} > {WGRAD_REPRO_TOL}"
+    elif enable and key in ("x", "gate_kernel"):
+        e = _rel_err(test, ref)
+        assert e <= ROUTING_GRAD_REPRO_TOL, f"{key}: rel err {e} > {ROUTING_GRAD_REPRO_TOL}"
     else:
         np.testing.assert_array_equal(_global(test), _global(ref), err_msg=key)
 
@@ -369,7 +383,11 @@ def test_moe_overlap_matches_flag_off(layout, score_function, weight_layout):
             warnings.simplefilter("always")
             on_fn, out, gp, gx = _value_and_grads(
                 lambda p, x: _moe_apply(
-                    layout, p, x, enable=True, weight_layout=weight_layout,
+                    layout,
+                    p,
+                    x,
+                    enable=True,
+                    weight_layout=weight_layout,
                     score_function=score_function,
                 ),
                 params,
@@ -393,8 +411,11 @@ def test_moe_overlap_matches_flag_off(layout, score_function, weight_layout):
         "gate_kernel": _rel_err(gp["gate_kernel"], ref_gp["gate_kernel"]),
     }
     if jax.process_index() == 0:
-        print(f"[moe {layout['name']} {score_function} {weight_layout}] max |on-off|/max|off|:"
-              f" {errs}", flush=True)
+        print(
+            f"[moe {layout['name']} {score_function} {weight_layout}] max |on-off|/max|off|:"
+            f" {errs}",
+            flush=True,
+        )
     for k, e in errs.items():
         assert np.isfinite(e) and e <= REL_TOL[k], f"{k}: rel err {e} > {REL_TOL[k]}"
 
@@ -466,9 +487,11 @@ def test_no_kernel_compile_at_execution(layout):
             jax.block_until_ready(compiled(params, x))
         after_exec = _COMPILE_COUNTER["calls"]
     if jax.process_index() == 0:
-        print(f"[{layout['name']}] CuTeDSL entry calls: during trace+compile"
-              f" {after_trace - before_trace}, during 3 executions {after_exec - after_trace}",
-              flush=True)
+        print(
+            f"[{layout['name']}] CuTeDSL entry calls: during trace+compile"
+            f" {after_trace - before_trace}, during 3 executions {after_exec - after_trace}",
+            flush=True,
+        )
     assert after_trace > before_trace, "the new GEMM configuration was not compiled at trace time"
     assert after_exec == after_trace, "a CuTeDSL GEMM was compiled/looked up at execution time"
 
@@ -506,8 +529,9 @@ def test_block_is_bitwise_moe(layout, enable, weight_layout):
             jax.jit(block.init, out_shardings=shardings)(jax.random.PRNGKey(14), x)
         )
         if native:
-            default_block = block.clone(cudnn_native_weight_layout=False,
-                                        fc2_native_weight_layout=False)
+            default_block = block.clone(
+                cudnn_native_weight_layout=False, fc2_native_weight_layout=False
+            )
             d_abstract = jax.eval_shape(default_block.init, jax.random.PRNGKey(14), x)
             d_shardings = nn.logical_to_mesh_sharding(
                 nn.get_partition_spec(d_abstract), layout["mesh"], layout["rules"]
@@ -517,9 +541,7 @@ def test_block_is_bitwise_moe(layout, enable, weight_layout):
             )
             got = _from_layout(dict(variables["params"]), "native")
             for k in ("wi", "wo", "gate_kernel"):
-                np.testing.assert_array_equal(
-                    _global(got[k]), _global(default_vars["params"][k])
-                )
+                np.testing.assert_array_equal(_global(got[k]), _global(default_vars["params"][k]))
         _, b_out, b_gp, b_gx = _value_and_grads(
             lambda p, x: block.apply({"params": p}, x)[0], variables["params"], x, dy
         )
@@ -530,15 +552,16 @@ def test_block_is_bitwise_moe(layout, enable, weight_layout):
             dy,
         )
     np.testing.assert_array_equal(_global(b_out), _global(m_out))
-    np.testing.assert_array_equal(_global(b_gx), _global(m_gx))
+    _assert_same(b_gx, m_gx, "x", enable)
     for k in ("wi", "wo", "gate_kernel"):
-        _assert_same(b_gp[k], m_gp[k], k)
+        _assert_same(b_gp[k], m_gp[k], k, enable)
 
 
 @pytest.mark.parametrize("enable", [False, True], ids=["flag_off", "flag_on"])
 def test_run_to_run_reproducibility(layout, enable):
-    """Output, dx and the gate (routing) gradient are bitwise reproducible; the expert weight
-    gradients are reproducible only within WGRAD_REPRO_TOL on both paths."""
+    """The output is bitwise reproducible; dx and the gate gradient are bitwise with the flag off
+    and within ROUTING_GRAD_REPRO_TOL (BF16 last-bit flips) with it on; expert weight gradients within WGRAD_REPRO_TOL.
+    """
     with _ctx(layout):
         params = _shard_params(layout, _make_params(layout, 3), "default")
         x = _make_x(layout, 4)
@@ -548,9 +571,12 @@ def test_run_to_run_reproducibility(layout, enable):
         _, out2, gp2, gx2 = _value_and_grads(f, params, x, dy)
     counts = {k: int(np.sum(_global(gp1[k]) != _global(gp2[k]))) for k in ("wi", "wo")}
     if jax.process_index() == 0:
-        print(f"[{layout['name']} enable={enable}] run-to-run differing weight-grad elements:"
-              f" {counts}", flush=True)
+        print(
+            f"[{layout['name']} enable={enable}] run-to-run differing weight-grad elements:"
+            f" {counts}",
+            flush=True,
+        )
     np.testing.assert_array_equal(_global(out1), _global(out2))
-    np.testing.assert_array_equal(_global(gx1), _global(gx2))
+    _assert_same(gx1, gx2, "x", enable)
     for k in ("wi", "wo", "gate_kernel"):
-        _assert_same(gp1[k], gp2[k], k)
+        _assert_same(gp1[k], gp2[k], k, enable)

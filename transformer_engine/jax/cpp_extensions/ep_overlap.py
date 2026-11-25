@@ -61,8 +61,9 @@ def ep_overlap_env_reason():
 
 
 @functools.lru_cache(maxsize=None)
-def ep_overlap_workspace_size(hidden, ffn, num_local_experts, recv_capacity, top_k, alignment,
-                              topk_idx_dtype=jnp.int32):
+def ep_overlap_workspace_size(
+    hidden, ffn, num_local_experts, recv_capacity, top_k, alignment, topk_idx_dtype=jnp.int32
+):
     """Workspace bytes for every overlap call of a layer.
 
     Also compiles, ahead of time, every CuTeDSL GEMM the layer's four calls will launch
@@ -99,7 +100,7 @@ def ep_dispatch_gemm_fwd(topk_idx, tokens, topk_weights, w1, *, recv_capacity, a
     """Dispatch || FC1 + SwiGLU. Returns (recv_tokens [R,H], recv_w [R] f32, gemm_out [R,2F],
     act_out [R,F] (= silu(gate)*up*prob), counts [E] i32, offsets [E+4] i32 (use [3:]),
     handle_mem)."""
-    T, H = tokens.shape
+    H = tokens.shape[-1]
     K = topk_idx.shape[-1]
     E, F2, Hw = w1.shape
     assert Hw == H and F2 % 2 == 0, (w1.shape, tokens.shape)
@@ -123,8 +124,9 @@ def ep_dispatch_gemm_fwd(topk_idx, tokens, topk_weights, w1, *, recv_capacity, a
     return tuple(res[:7])
 
 
-def ep_combine_gemm_fwd(handle_mem, act_out, offsets, w2, *, num_tokens, top_k, alignment,
-                        topk_idx_dtype=jnp.int32):
+def ep_combine_gemm_fwd(
+    handle_mem, act_out, offsets, w2, *, num_tokens, top_k, alignment, topk_idx_dtype=jnp.int32
+):
     """FC2 || combine. Returns result [T, H] (sum over top-k of prob * FFN(x))."""
     R, F = act_out.shape
     E, H, Fw = w2.shape
@@ -141,8 +143,19 @@ def ep_combine_gemm_fwd(handle_mem, act_out, offsets, w2, *, num_tokens, top_k, 
     return result
 
 
-def ep_combine_gemm_bwd(handle_mem, grad_result, gemm_out, recv_w, counts, w2, act_out, *,
-                        top_k, alignment, topk_idx_dtype=jnp.int32):
+def ep_combine_gemm_bwd(
+    handle_mem,
+    grad_result,
+    gemm_out,
+    recv_w,
+    counts,
+    w2,
+    act_out,
+    *,
+    top_k,
+    alignment,
+    topk_idx_dtype=jnp.int32,
+):
     """Combine bwd || FC2 dgrad + SwiGLU bwd, + FC2 wgrad. Returns
     (grad_gemm_out [R,2F], grad_recv_w [R] f32, d_w2 [E,H,F])."""
     R, F2 = gemm_out.shape
@@ -168,8 +181,19 @@ def ep_combine_gemm_bwd(handle_mem, grad_result, gemm_out, recv_w, counts, w2, a
     return grad_gemm_out, grad_recv_w, d_w2
 
 
-def ep_dispatch_gemm_bwd(handle_mem, grad_gemm_out, grad_recv_w, counts, w1, recv_tokens, *,
-                         num_tokens, top_k, alignment, topk_idx_dtype=jnp.int32):
+def ep_dispatch_gemm_bwd(
+    handle_mem,
+    grad_gemm_out,
+    grad_recv_w,
+    counts,
+    w1,
+    recv_tokens,
+    *,
+    num_tokens,
+    top_k,
+    alignment,
+    topk_idx_dtype=jnp.int32,
+):
     """FC1 dgrad + FC1 wgrad || dispatch bwd. Returns
     (grad_tokens [T,H], grad_topk_weights [T,K] f32, d_w1 [E,2F,H])."""
     R, F2 = grad_gemm_out.shape
