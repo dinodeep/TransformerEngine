@@ -2577,6 +2577,18 @@ def moe(
         E4M3 quantizers are supported, and the hidden size must be a multiple of 512. The
         quantizer's layout is ignored; tokens are always quantized rowwise. Defaults to
         ``None`` (no dispatch quantization).
+    enable_ep_overlap : bool
+        Run dispatch -> FC1 -> SwiGLU -> FC2 -> combine and its backward as NCCL EP calls
+        overlapped with CuTeDSL grouped GEMMs (device readiness signals; ep_gemm.h). Needs
+        ``NVTE_ENABLE_CUTEDSL_BACKEND=1``, ``NVTE_MOE_OVERLAP``, ``ep_bootstrap(num_topk=top_k)``,
+        BF16, SwiGLU, no biases, hidden % 256 == 0 and FFN % 64 == 0; other calls warn and run the
+        regular path. Matches the regular path within BF16 rounding (the routing weight is applied
+        before FC2). Defaults to ``False``.
+    fc2_native_weight_layout : bool
+        ``True`` selects FC2 storage ``wo`` [E, H, F] (the overlap GEMM's layout) instead of
+        [E, F, H]. With ``enable_ep_overlap``, use it together with
+        ``cudnn_native_weight_layout=True`` to avoid a per-step weight layout conversion.
+        Defaults to ``False``.
 
     Notes
     -----
@@ -2700,6 +2712,16 @@ def moe(
                     _EP_OVERLAP_FC2_NATIVE if fc2_native_weight_layout else _EP_OVERLAP_ON
                 )
                 use_cudnn_jax_fusion = False
+                if not (cudnn_native_weight_layout and fc2_native_weight_layout):
+                    warnings.warn(
+                        "enable_ep_overlap=True with weights stored in the default layout: the"
+                        " overlap GEMMs read wi as [E, 2F, H] (cudnn_native_weight_layout=True) and"
+                        " wo as [E, H, F] (fc2_native_weight_layout=True), so each pass converts"
+                        " the weights in the graph (one weight-sized copy each way), which can"
+                        " cost more than the overlap saves.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
         if fc2_native_weight_layout and not use_ep_overlap:
             # wo is stored [E, H, F] (the overlap GEMM's layout); the regular path reads [E, F, H].
             wo = wo.transpose(0, 2, 1)

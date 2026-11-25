@@ -8,11 +8,13 @@ Multiprocess, one GPU per process; launch with the TE-EP MoE launcher::
     NVTE_ENABLE_CUTEDSL_BACKEND=1 NVTE_MOE_OVERLAP=<EPCompOverlap>/gemm \\
     TEST_FILE=tests/jax/test_te_ep_moe_overlap.py bash tests/jax/run_te_ep_moe.sh
 
-Each mesh layout (EP4, FSDP2 x EP2 on 4 GPUs) bootstraps EP once. For every layout the test
-compares the overlapped block against the same block with the flag off (same parameters and
-inputs): the output, and the gradients of the input, both expert weights and the gate kernel
-(the gate kernel gradient carries the routing-weight gradient). It also asserts that the
-overlap custom calls are in the compiled program and that no fallback warning was raised.
+Each mesh layout (EP4; FSDP2 x EP2 with the expert weights' hidden dim over fsdp; FSDP2 x EP2 with
+the expert dim over (ep, fsdp)) bootstraps EP once. The functional ``moe()`` is tested first:
+flag-on vs flag-off for the output and the gradients of the input, both expert weights and the
+gate kernel (which carries the routing-weight gradient), in the default and the native weight
+layouts, with a check that all four overlap custom calls are in the compiled program and that no
+fallback happened; the fallback path; and that no CuTeDSL kernel is compiled at execution. Then the
+Flax ``_MoEBlock`` is checked to be bitwise identical to ``moe()`` for the same parameters.
 """
 
 import os
@@ -61,8 +63,14 @@ if not (os.environ.get("NVTE_ENABLE_CUTEDSL_BACKEND") == "1" and os.environ.get(
     )
 
 from transformer_engine.jax.flax import _MoEBlock as MoEBlock  # noqa: E402
+from transformer_engine.jax.cpp_extensions import (  # noqa: E402
+    pack_gated_activation_pair,
+    unpack_gated_activation_pair,
+)
 from transformer_engine.jax.moe import (  # noqa: E402
+    RouterComputationInfo,
     get_moe_recv_capacity_per_rank,
+    moe,
     record_ep_bootstrap_signature_for_moe,
 )
 from transformer_engine.jax.ep import ep_bootstrap, ep_finalize  # noqa: E402
@@ -89,12 +97,15 @@ OVERLAP_TARGETS = (
     "te_ep_dispatch_gemm_bwd_ffi",
 )
 
-LAYOUTS = {"ep4": 1, "fsdp2_ep2": 2}
+# name -> (fsdp size, expert-weight FSDP mode). "hidden": the hidden dim of the expert weights is
+# sharded over fsdp (TE's default logical rules); "expert": the expert dim over (ep, fsdp).
+LAYOUTS = {"ep4": (1, None), "fsdp2_ep2": (2, "hidden"), "fsdp2_ep2_expert": (2, "expert")}
+WEIGHT_LAYOUTS = ("default", "native")
 
 
 @pytest.fixture(scope="module", params=list(LAYOUTS), ids=list(LAYOUTS))
 def layout(request):
-    fsdp = LAYOUTS[request.param]
+    fsdp, fsdp_mode = LAYOUTS[request.param]
     n = jax.device_count()
     if n % fsdp or n // fsdp < 2:
         pytest.skip(f"layout {request.param} needs a multiple of {2 * fsdp} devices")
@@ -102,7 +113,10 @@ def layout(request):
     if fsdp > 1:
         mesh = Mesh(np.asarray(jax.devices()).reshape(fsdp, ep), ("fsdp", "ep"))
         mr = MeshResource(ep_resource="ep", fsdp_resource="fsdp")
-        rules = (("exp", "ep"), ("embed", "fsdp"), ("mlp", None), ("batch", ("fsdp", "ep")))
+        if fsdp_mode == "expert":
+            rules = (("exp", ("ep", "fsdp")), ("embed", None), ("mlp", None), ("batch", ("fsdp", "ep")))
+        else:
+            rules = (("exp", "ep"), ("embed", "fsdp"), ("mlp", None), ("batch", ("fsdp", "ep")))
         batch_axes = ("fsdp", "ep")
     else:
         mesh = Mesh(np.asarray(jax.devices()).reshape(ep), ("ep",))
@@ -180,32 +194,109 @@ def _install_compile_counter():
 _COMPILE_COUNTER = _install_compile_counter()
 
 
-def _block(enable, **kw):
-    return MoEBlock(
-        num_experts=NUM_EXPERTS,
-        num_experts_per_tok=TOPK,
-        intermediate_size=kw.pop("intermediate_size", INTER),
-        dtype=DTYPE,
-        input_axes=("batch", None, None),
-        use_cudnn_fusion=False,
-        collect_expert_counts=False,
-        enable_ep_overlap=enable,
-        **kw,
-    )
+WI_AXES = ("exp", "embed", "mlp")
+WO_AXES = ("exp", "mlp", "embed")
 
 
-def _setup(layout, key=0, **kw):
-    mesh, rules = layout["mesh"], layout["rules"]
+def _fc1_to_native(wi):
+    gate, up = jnp.split(wi, 2, axis=-1)
+    return pack_gated_activation_pair(gate, up).transpose(0, 2, 1)
+
+
+def _fc1_from_native(wi):
+    gate, up = unpack_gated_activation_pair(wi.transpose(0, 2, 1))
+    return jnp.concatenate((gate, up), axis=-1)
+
+
+def _to_layout(params, weight_layout):
+    if weight_layout == "default":
+        return params
+    p = dict(params)
+    p["wi"] = _fc1_to_native(p["wi"])
+    p["wo"] = p["wo"].transpose(0, 2, 1)
+    return p
+
+
+def _from_layout(params, weight_layout):
+    if weight_layout == "default":
+        return params
+    p = dict(params)
+    p["wi"] = _fc1_from_native(p["wi"])
+    p["wo"] = p["wo"].transpose(0, 2, 1)
+    return p
+
+
+def _axes(weight_layout):
+    if weight_layout == "default":
+        return WI_AXES, WO_AXES
+    return (WI_AXES[0], WI_AXES[2], WI_AXES[1]), (WO_AXES[0], WO_AXES[2], WO_AXES[1])
+
+
+def _shard_params(layout, params, weight_layout):
+    wi_axes, wo_axes = _axes(weight_layout)
+    specs = {"gate_kernel": (None, None), "wi": wi_axes, "wo": wo_axes}
+    rules = dict(layout["rules"])
+    return {
+        k: jax.device_put(
+            v,
+            NamedSharding(layout["mesh"], P(*(rules.get(a) if a else None for a in specs[k]))),
+        )
+        for k, v in params.items()
+    }
+
+
+def _make_params(layout, key, inter=INTER):
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(key), 3)
+    params = {
+        "gate_kernel": jax.random.normal(k1, (HIDDEN, NUM_EXPERTS), DTYPE) * HIDDEN**-0.5,
+        "wi": jax.random.normal(k2, (NUM_EXPERTS, HIDDEN, 2 * inter), DTYPE) * HIDDEN**-0.5,
+        "wo": jax.random.normal(k3, (NUM_EXPERTS, inter, HIDDEN), DTYPE) * inter**-0.5,
+    }
+    return params
+
+
+def _make_x(layout, key):
     n = jax.device_count()
     x = jax.random.normal(jax.random.PRNGKey(key), (n * BATCH_PER_RANK, SEQ, HIDDEN), DTYPE)
-    x = jax.device_put(x, NamedSharding(mesh, P(layout["batch_axes"], None, None)))
-    block = _block(False, **kw)
-    abstract = jax.eval_shape(block.init, jax.random.PRNGKey(1), x)
-    shardings = nn.logical_to_mesh_sharding(nn.get_partition_spec(abstract), mesh, rules)
-    variables = nn.unbox(
-        jax.jit(block.init, out_shardings=shardings)(jax.random.PRNGKey(key + 1), x)
+    return jax.device_put(x, NamedSharding(layout["mesh"], P(layout["batch_axes"], None, None)))
+
+
+def _moe_apply(layout, params, x, *, enable, weight_layout, score_function="softmax", **kw):
+    wi_axes, wo_axes = _axes(weight_layout)
+    native = weight_layout == "native"
+    router = RouterComputationInfo(
+        gate_kernel=params["gate_kernel"],
+        num_experts_per_tok=TOPK,
+        score_function=score_function,
     )
-    return x, variables
+    return moe(
+        x,
+        router,
+        params["wi"],
+        params["wo"],
+        num_experts=NUM_EXPERTS,
+        mesh_resource=layout["mr"],
+        input_axes=("batch", None, None),
+        wi_kernel_axes=wi_axes,
+        wo_kernel_axes=wo_axes,
+        dtype=DTYPE,
+        use_cudnn_fusion=False,
+        collect_expert_counts=False,
+        cudnn_native_weight_layout=native,
+        fc2_native_weight_layout=native,
+        enable_ep_overlap=enable,
+        **kw,
+    )[0]
+
+
+def _value_and_grads(apply_fn, params, x, dy):
+    def loss(p, x):
+        out = apply_fn(p, x)
+        return jnp.sum(out.astype(jnp.float32) * dy.astype(jnp.float32)), out
+
+    fn = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))
+    (_, out), (gp, gx) = fn(params, x)
+    return fn, out, gp, gx
 
 
 def _ctx(layout):
@@ -225,15 +316,6 @@ def _ctx(layout):
     return _C()
 
 
-def _loss_and_grads(block, variables, x, dy):
-    def loss(v, x):
-        out = block.apply(v, x)[0]
-        return jnp.sum(out.astype(jnp.float32) * dy.astype(jnp.float32)), out
-
-    fn = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))
-    return fn, fn(variables, x)
-
-
 def _global(a):
     return np.asarray(multihost_utils.process_allgather(a, tiled=True), np.float32)
 
@@ -243,138 +325,232 @@ def _rel_err(test, ref):
     return float(np.max(np.abs(test - ref)) / max(np.max(np.abs(ref)), 1e-30))
 
 
+# The expert weight gradients are not bitwise reproducible run to run on either path (flag-off:
+# TE's grouped-GEMM weight gradient; flag-on: the CuTeDSL weight-gradient GEMMs split tiles across
+# two launches), while the output, dx and the gate gradient are. "Bitwise" checks therefore compare
+# expert weight gradients within this bound (max |a - b| / max |b|), measured run-to-run at ~3e-3.
+WGRAD_REPRO_TOL = 1e-2
+
+
+def _assert_same(test, ref, key):
+    if key in ("wi", "wo"):
+        e = _rel_err(test, ref)
+        assert e <= WGRAD_REPRO_TOL, f"{key}: rel err {e} > {WGRAD_REPRO_TOL}"
+    else:
+        np.testing.assert_array_equal(_global(test), _global(ref), err_msg=key)
+
+
+def _hlo(fn, *args):
+    return fn.lower(*args).as_text()
+
+
+# ----------------------------------------------------------------------------- moe()
+
+
+@pytest.mark.parametrize("weight_layout", WEIGHT_LAYOUTS)
 @pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
-def test_overlap_matches_flag_off(layout, score_function):
-    """Output and input/weight/routing gradients of flag-on match flag-off."""
+def test_moe_overlap_matches_flag_off(layout, score_function, weight_layout):
+    """moe(): flag-on output and dx/dwi/dwo/dgate match the flag-off default-layout reference."""
     with _ctx(layout):
-        x, variables = _setup(layout, score_function=score_function)
-        dy = jax.random.normal(jax.random.PRNGKey(7), x.shape, DTYPE)
-        dy = jax.device_put(dy, x.sharding)
-        ref_fn, ((_, ref_out), (ref_gv, ref_gx)) = _loss_and_grads(
-            _block(False, score_function=score_function), variables, x, dy
+        std = _make_params(layout, 0)
+        x = _make_x(layout, 1)
+        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(2), x.shape, DTYPE), x.sharding)
+        ref_params = _shard_params(layout, std, "default")
+        ref_fn, ref_out, ref_gp, ref_gx = _value_and_grads(
+            lambda p, x: _moe_apply(
+                layout, p, x, enable=False, weight_layout="default", score_function=score_function
+            ),
+            ref_params,
+            x,
+            dy,
         )
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error", message=".*EP overlap skipped.*")
-            on_block = _block(True, score_function=score_function)
-            on_fn, ((_, out), (gv, gx)) = _loss_and_grads(on_block, variables, x, dy)
-        hlo = on_fn.lower(variables, x).as_text()
+        params = _shard_params(layout, _to_layout(std, weight_layout), weight_layout)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            on_fn, out, gp, gx = _value_and_grads(
+                lambda p, x: _moe_apply(
+                    layout, p, x, enable=True, weight_layout=weight_layout,
+                    score_function=score_function,
+                ),
+                params,
+                x,
+                dy,
+            )
+        messages = [str(w.message) for w in caught]
+        assert not any("EP overlap skipped" in m for m in messages), messages
+        assert any("default layout" in m for m in messages) == (weight_layout == "default")
+        hlo = _hlo(on_fn, params, x)
         for target in OVERLAP_TARGETS:
             assert target in hlo, f"{target} missing: the overlap path did not run"
-        assert "te_ep_dispatch_gemm_fwd_ffi" not in ref_fn.lower(variables, x).as_text()
+        assert "te_ep_dispatch_gemm_fwd_ffi" not in _hlo(ref_fn, ref_params, x)
+        gp = _from_layout(gp, weight_layout)
 
     errs = {
         "out": _rel_err(out, ref_out),
         "x": _rel_err(gx, ref_gx),
-        "wi": _rel_err(gv["params"]["wi"], ref_gv["params"]["wi"]),
-        "wo": _rel_err(gv["params"]["wo"], ref_gv["params"]["wo"]),
-        "gate_kernel": _rel_err(gv["params"]["gate_kernel"], ref_gv["params"]["gate_kernel"]),
+        "wi": _rel_err(gp["wi"], ref_gp["wi"]),
+        "wo": _rel_err(gp["wo"], ref_gp["wo"]),
+        "gate_kernel": _rel_err(gp["gate_kernel"], ref_gp["gate_kernel"]),
     }
     if jax.process_index() == 0:
-        print(f"[{layout['name']} {score_function}] max rel err vs flag-off: {errs}", flush=True)
+        print(f"[moe {layout['name']} {score_function} {weight_layout}] max |on-off|/max|off|:"
+              f" {errs}", flush=True)
     for k, e in errs.items():
         assert np.isfinite(e) and e <= REL_TOL[k], f"{k}: rel err {e} > {REL_TOL[k]}"
 
 
-def test_ineligible_layer_falls_back(layout):
-    """A layer the overlap cannot run warns and matches the flag-off block bitwise.
+def test_moe_native_layout_flag_off_is_bitwise_default(layout):
+    """moe(): with the flag off, the native layouts only change storage (bitwise same results)."""
+    with _ctx(layout):
+        std = _make_params(layout, 3)
+        x = _make_x(layout, 4)
+        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), x.shape, DTYPE), x.sharding)
+        _, ref_out, ref_gp, ref_gx = _value_and_grads(
+            lambda p, x: _moe_apply(layout, p, x, enable=False, weight_layout="default"),
+            _shard_params(layout, std, "default"),
+            x,
+            dy,
+        )
+        _, out, gp, gx = _value_and_grads(
+            lambda p, x: _moe_apply(layout, p, x, enable=False, weight_layout="native"),
+            _shard_params(layout, _to_layout(std, "native"), "native"),
+            x,
+            dy,
+        )
+        gp = _from_layout(gp, "native")
+    np.testing.assert_array_equal(_global(out), _global(ref_out))
+    np.testing.assert_array_equal(_global(gx), _global(ref_gx))
+    for k in ("wi", "wo", "gate_kernel"):
+        _assert_same(gp[k], ref_gp[k], k)
 
-    The ineligibility used is a dispatch checkpoint name (unsupported by the overlap path), which
-    leaves the regular path's math unchanged.
-    """
+
+def test_moe_ineligible_falls_back(layout):
+    """moe(): an ineligible call warns and is bitwise the flag-off result (here: a dispatch
+    checkpoint name, which the overlap path does not support)."""
     kw = dict(dispatch_checkpoint_name="moe_dispatch")
     with _ctx(layout):
-        x, variables = _setup(layout, key=3, **kw)
-        ref = jax.jit(_block(False, **kw).apply)(variables, x)[0]
+        params = _shard_params(layout, _to_layout(_make_params(layout, 6), "native"), "native")
+        x = _make_x(layout, 7)
+        ref = jax.jit(
+            lambda p, x: _moe_apply(layout, p, x, enable=False, weight_layout="native", **kw)
+        )(params, x)
         with pytest.warns(UserWarning, match="EP overlap skipped.*checkpoint names"):
-            fn = jax.jit(_block(True, **kw).apply)
-            out = fn(variables, x)[0]
-        assert "te_ep_dispatch_gemm_fwd_ffi" not in fn.lower(variables, x).as_text()
+            fn = jax.jit(
+                lambda p, x: _moe_apply(layout, p, x, enable=True, weight_layout="native", **kw)
+            )
+            out = fn(params, x)
+        assert "te_ep_dispatch_gemm_fwd_ffi" not in _hlo(fn, params, x)
     np.testing.assert_array_equal(_global(out), _global(ref))
 
 
-def _to_standard(gv):
-    """Map ep_overlap_weight_layout gradients/params back to the default layout."""
-    from transformer_engine.jax.cpp_extensions import unpack_gated_activation_pair
-
-    p = dict(gv["params"])
-    gate, up = unpack_gated_activation_pair(p["wi"].transpose(0, 2, 1))
-    p["wi"] = jnp.concatenate((gate, up), axis=-1)
-    p["wo"] = p["wo"].transpose(0, 2, 1)
-    return {"params": p}
-
-
-def test_overlap_native_weight_layout(layout):
-    """ep_overlap_weight_layout stores weights as the overlap GEMMs read them (no per-step
-    conversion in the graph); it initializes the same values as the default layout, matches the
-    default-layout flag-off block, and its own flag-off fallback is bitwise equal to it."""
-    mesh = layout["mesh"]
-    with _ctx(layout):
-        x, variables = _setup(layout, key=5)
-        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(9), x.shape, DTYPE), x.sharding)
-        native_block = _block(True, ep_overlap_weight_layout=True)
-        abstract = jax.eval_shape(native_block.init, jax.random.PRNGKey(6), x)
-        shardings = nn.logical_to_mesh_sharding(nn.get_partition_spec(abstract), mesh, layout["rules"])
-        native_vars = nn.unbox(
-            jax.jit(native_block.init, out_shardings=shardings)(jax.random.PRNGKey(6), x)
-        )
-        # Same init key in both layouts gives the same values.
-        for k in ("wi", "wo", "gate_kernel"):
-            np.testing.assert_array_equal(
-                _global(_to_standard(native_vars)["params"][k]), _global(variables["params"][k])
-            )
-        _, ((_, ref_out), (ref_gv, ref_gx)) = _loss_and_grads(_block(False), variables, x, dy)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error", message=".*EP overlap skipped.*")
-            on_fn, ((_, out), (gv, gx)) = _loss_and_grads(native_block, native_vars, x, dy)
-        hlo = on_fn.lower(native_vars, x).as_text()
-        assert "te_ep_dispatch_gemm_fwd_ffi" in hlo
-        # Fallback with the native layout (flag off) converts back and is bitwise the default.
-        _, ((_, fb_out), (fb_gv, fb_gx)) = _loss_and_grads(
-            _block(False, ep_overlap_weight_layout=True), native_vars, x, dy
-        )
-    np.testing.assert_array_equal(_global(fb_out), _global(ref_out))
-    np.testing.assert_array_equal(_global(fb_gx), _global(ref_gx))
-    gv_std = _to_standard(gv)
-    errs = {
-        "out": _rel_err(out, ref_out),
-        "x": _rel_err(gx, ref_gx),
-        "wi": _rel_err(gv_std["params"]["wi"], ref_gv["params"]["wi"]),
-        "wo": _rel_err(gv_std["params"]["wo"], ref_gv["params"]["wo"]),
-        "gate_kernel": _rel_err(gv["params"]["gate_kernel"], ref_gv["params"]["gate_kernel"]),
-    }
-    if jax.process_index() == 0:
-        print(f"[{layout['name']} native layout] max rel err vs flag-off: {errs}", flush=True)
-    for k, e in errs.items():
-        assert np.isfinite(e) and e <= REL_TOL[k], f"{k}: rel err {e} > {REL_TOL[k]}"
-
-
 def test_no_kernel_compile_at_execution(layout):
-    """The CuTeDSL GEMMs compile while jit traces (the workspace-size query); executing the
+    """The CuTeDSL GEMMs compile while jit traces (nvte_ep_overlap_compile); executing the
     compiled step, first and later, never re-enters the Python compile/register entry points."""
     # An FFN size no other test uses, so this layer's GEMM configurations are new.
-    inter = 384 if layout["name"] == "ep4" else 448
+    inter = {"ep4": 384, "fsdp2_ep2": 448, "fsdp2_ep2_expert": 512}[layout["name"]]
     with _ctx(layout):
-        x, variables = _setup(layout, key=11, intermediate_size=inter)
-        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(12), x.shape, DTYPE), x.sharding)
-        block = _block(True, intermediate_size=inter)
-        before_trace = _COMPILE_COUNTER["calls"]
+        params = _shard_params(
+            layout, _to_layout(_make_params(layout, 8, inter=inter), "native"), "native"
+        )
+        x = _make_x(layout, 9)
+        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(10), x.shape, DTYPE), x.sharding)
 
-        def loss(v, x):
-            out = block.apply(v, x)[0]
+        def loss(p, x):
+            out = _moe_apply(layout, p, x, enable=True, weight_layout="native")
             return jnp.sum(out.astype(jnp.float32) * dy.astype(jnp.float32))
 
-        compiled = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(variables, x).compile()
+        before_trace = _COMPILE_COUNTER["calls"]
+        compiled = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x).compile()
         after_trace = _COMPILE_COUNTER["calls"]
         for _ in range(3):
-            jax.block_until_ready(compiled(variables, x))
+            jax.block_until_ready(compiled(params, x))
         after_exec = _COMPILE_COUNTER["calls"]
     if jax.process_index() == 0:
         print(f"[{layout['name']}] CuTeDSL entry calls: during trace+compile"
               f" {after_trace - before_trace}, during 3 executions {after_exec - after_trace}",
               flush=True)
-    if jax.process_index() == 0:
-        for i, (name, args) in enumerate(_COMPILE_COUNTER["log"][-(after_exec - before_trace):]):
-            print(f"  entry {i} {'EXEC' if i >= after_trace - before_trace else 'TRACE'}: {name}"
-                  f" {args}", flush=True)
     assert after_trace > before_trace, "the new GEMM configuration was not compiled at trace time"
     assert after_exec == after_trace, "a CuTeDSL GEMM was compiled/looked up at execution time"
+
+
+# ----------------------------------------------------------------------------- _MoEBlock
+
+
+@pytest.mark.parametrize("weight_layout", WEIGHT_LAYOUTS)
+@pytest.mark.parametrize("enable", [False, True], ids=["flag_off", "flag_on"])
+def test_block_is_bitwise_moe(layout, enable, weight_layout):
+    """_MoEBlock is a thin wrapper: for its own parameters it gives bitwise the outputs and
+    gradients of moe(); native layouts initialize the same values as the default layout."""
+    native = weight_layout == "native"
+    block = MoEBlock(
+        num_experts=NUM_EXPERTS,
+        num_experts_per_tok=TOPK,
+        intermediate_size=INTER,
+        dtype=DTYPE,
+        input_axes=("batch", None, None),
+        use_cudnn_fusion=False,
+        collect_expert_counts=False,
+        enable_ep_overlap=enable,
+        cudnn_native_weight_layout=native,
+        fc2_native_weight_layout=native,
+        mesh_resource=layout["mr"],
+    )
+    with _ctx(layout):
+        x = _make_x(layout, 12)
+        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(13), x.shape, DTYPE), x.sharding)
+        abstract = jax.eval_shape(block.init, jax.random.PRNGKey(14), x)
+        shardings = nn.logical_to_mesh_sharding(
+            nn.get_partition_spec(abstract), layout["mesh"], layout["rules"]
+        )
+        variables = nn.unbox(
+            jax.jit(block.init, out_shardings=shardings)(jax.random.PRNGKey(14), x)
+        )
+        if native:
+            default_block = block.clone(cudnn_native_weight_layout=False,
+                                        fc2_native_weight_layout=False)
+            d_abstract = jax.eval_shape(default_block.init, jax.random.PRNGKey(14), x)
+            d_shardings = nn.logical_to_mesh_sharding(
+                nn.get_partition_spec(d_abstract), layout["mesh"], layout["rules"]
+            )
+            default_vars = nn.unbox(
+                jax.jit(default_block.init, out_shardings=d_shardings)(jax.random.PRNGKey(14), x)
+            )
+            got = _from_layout(dict(variables["params"]), "native")
+            for k in ("wi", "wo", "gate_kernel"):
+                np.testing.assert_array_equal(
+                    _global(got[k]), _global(default_vars["params"][k])
+                )
+        _, b_out, b_gp, b_gx = _value_and_grads(
+            lambda p, x: block.apply({"params": p}, x)[0], variables["params"], x, dy
+        )
+        _, m_out, m_gp, m_gx = _value_and_grads(
+            lambda p, x: _moe_apply(layout, p, x, enable=enable, weight_layout=weight_layout),
+            variables["params"],
+            x,
+            dy,
+        )
+    np.testing.assert_array_equal(_global(b_out), _global(m_out))
+    np.testing.assert_array_equal(_global(b_gx), _global(m_gx))
+    for k in ("wi", "wo", "gate_kernel"):
+        _assert_same(b_gp[k], m_gp[k], k)
+
+
+@pytest.mark.parametrize("enable", [False, True], ids=["flag_off", "flag_on"])
+def test_run_to_run_reproducibility(layout, enable):
+    """Output, dx and the gate (routing) gradient are bitwise reproducible; the expert weight
+    gradients are reproducible only within WGRAD_REPRO_TOL on both paths."""
+    with _ctx(layout):
+        params = _shard_params(layout, _make_params(layout, 3), "default")
+        x = _make_x(layout, 4)
+        dy = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), x.shape, DTYPE), x.sharding)
+        f = lambda p, x: _moe_apply(layout, p, x, enable=enable, weight_layout="default")
+        _, out1, gp1, gx1 = _value_and_grads(f, params, x, dy)
+        _, out2, gp2, gx2 = _value_and_grads(f, params, x, dy)
+    counts = {k: int(np.sum(_global(gp1[k]) != _global(gp2[k]))) for k in ("wi", "wo")}
+    if jax.process_index() == 0:
+        print(f"[{layout['name']} enable={enable}] run-to-run differing weight-grad elements:"
+              f" {counts}", flush=True)
+    np.testing.assert_array_equal(_global(out1), _global(out2))
+    np.testing.assert_array_equal(_global(gx1), _global(gx2))
+    for k in ("wi", "wo", "gate_kernel"):
+        _assert_same(gp1[k], gp2[k], k)

@@ -132,14 +132,18 @@ class _MoEBlock(TransformerEngineBase):
         ``NVTE_MOE_OVERLAP``; BF16, SwiGLU, no biases, hidden a multiple of 256 and
         ``intermediate_size`` a multiple of 64. Ineligible layers warn and use the regular path.
         Default ``False``.
-    ep_overlap_weight_layout : bool
-        Store the expert weights in the layout the overlap GEMMs read, so no per-step layout
-        conversion runs: ``wi`` as ``[E, 2 * intermediate_size, hidden]`` with gate/up in
-        alternating 32-row blocks and ``wo`` as ``[E, hidden, intermediate_size]`` (logical axes
-        permuted accordingly). Values are initialized identically to the default layout (the
-        initializer runs in the default layout and is permuted). Changes the parameter shapes,
-        so checkpoints are not interchangeable with the default layout. The regular path
-        converts these weights back each pass. Default ``False``.
+    cudnn_native_weight_layout : bool
+        Store ``wi`` as ``[E, 2 * intermediate_size, hidden]`` with gate/up in alternating 32-row
+        blocks (the layout cuDNN's GLU fusion and the EP overlap FC1 GEMM read) instead of
+        ``[E, hidden, 2 * intermediate_size]``. Forwarded to :func:`moe`. Default ``False``.
+    fc2_native_weight_layout : bool
+        Store ``wo`` as ``[E, hidden, intermediate_size]`` (the EP overlap FC2 GEMM's layout)
+        instead of ``[E, intermediate_size, hidden]``. Forwarded to :func:`moe`. Default ``False``.
+
+    With either native layout the logical axes of the weight are permuted to match, and the
+    initializer runs in the default layout and is permuted, so the initial values equal the
+    default layout's. Checkpoints are not interchangeable between layouts. With
+    ``enable_ep_overlap`` both native layouts avoid a per-step weight layout conversion.
 
     Per-expert dispatch-slot alignment is 256 tokens when fusion is requested,
     including fallbacks, and 128 tokens with ``use_cudnn_fusion=False``.
@@ -190,7 +194,8 @@ class _MoEBlock(TransformerEngineBase):
     dispatch_quantization_recipe: Optional[Recipe] = None
     collect_expert_counts: bool = True
     enable_ep_overlap: bool = False
-    ep_overlap_weight_layout: bool = False
+    cudnn_native_weight_layout: bool = False
+    fc2_native_weight_layout: bool = False
 
     # Dtypes / init / misc
     dtype: DType = jnp.float32
@@ -261,21 +266,23 @@ class _MoEBlock(TransformerEngineBase):
         wo_shape = (self.num_experts, self.intermediate_size, hidden_size)
         wi_kernel_axes, wo_kernel_axes = self.wi_kernel_axes, self.wo_kernel_axes
         wi_init, wo_init = self.kernel_init, self.kernel_init
-        if self.ep_overlap_weight_layout:
-            # Initialize in the default layout, then permute, so values match it exactly.
+        # Native layouts initialize in the default layout, then permute, so values match it.
+        if self.cudnn_native_weight_layout:
+
             def wi_init(key, shape, dtype, _init=self.kernel_init, _shape=wi_shape):
                 del shape
-                w = _init(key, _shape, dtype)
-                gate, up = jnp.split(w, 2, axis=-1)
+                gate, up = jnp.split(_init(key, _shape, dtype), 2, axis=-1)
                 return pack_gated_activation_pair(gate, up).transpose(0, 2, 1)
+
+            wi_shape = (wi_shape[0], wi_shape[2], wi_shape[1])
+            wi_kernel_axes = (wi_kernel_axes[0], wi_kernel_axes[2], wi_kernel_axes[1])
+        if self.fc2_native_weight_layout:
 
             def wo_init(key, shape, dtype, _init=self.kernel_init, _shape=wo_shape):
                 del shape
                 return _init(key, _shape, dtype).transpose(0, 2, 1)
 
-            wi_shape = (wi_shape[0], wi_shape[2], wi_shape[1])
             wo_shape = (wo_shape[0], wo_shape[2], wo_shape[1])
-            wi_kernel_axes = (wi_kernel_axes[0], wi_kernel_axes[2], wi_kernel_axes[1])
             wo_kernel_axes = (wo_kernel_axes[0], wo_kernel_axes[2], wo_kernel_axes[1])
         wi = self.param(
             "wi",
@@ -380,7 +387,7 @@ class _MoEBlock(TransformerEngineBase):
                 num_experts=self.num_experts,
                 activation_type=self.activation_type,
                 use_cudnn_fusion=self.use_cudnn_fusion,
-                cudnn_native_weight_layout=self.ep_overlap_weight_layout,
+                cudnn_native_weight_layout=self.cudnn_native_weight_layout,
                 apply_topk_weights_early=self.apply_topk_weights_early,
                 quantizer_sets=quantizer_sets,
                 recv_capacity_per_rank=self.recv_capacity_per_rank,
@@ -394,5 +401,5 @@ class _MoEBlock(TransformerEngineBase):
                 dispatch_checkpoint_name=self.dispatch_checkpoint_name,
                 dispatch_quantizer=dispatch_quantizer,
                 enable_ep_overlap=self.enable_ep_overlap,
-                fc2_native_weight_layout=self.ep_overlap_weight_layout,
+                fc2_native_weight_layout=self.fc2_native_weight_layout,
             )
