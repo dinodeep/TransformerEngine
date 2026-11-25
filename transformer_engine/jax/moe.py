@@ -2370,22 +2370,6 @@ def _ep_overlap_gather_experts(arrays, fsdp_axis):
     return tuple(jax.lax.all_gather(a, fsdp_axis, axis=0, tiled=True) for a in arrays)
 
 
-def _ep_overlap_mxfp8_weight(w, columnwise):
-    """Grouped MXFP8 of a per-expert weight [E, m, n] with GEMM-swizzled scales along n (rowwise)
-    or along m (columnwise): (E4M3 data [E, m, n], flat scales E * m * n / 32)."""
-    E, m, n = w.shape
-    q = QuantizerFactory.create(
-        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
-        q_dtype=jnp.float8_e4m3fn,
-        q_layout=QuantizeLayout.COLWISE if columnwise else QuantizeLayout.ROWWISE,
-        n_groups=E,
-    )
-    t = tex.grouped_quantize(w, q, flatten_axis=-1)
-    if isinstance(t, ScaledTensor2x):
-        t = t.colwise_tensor if columnwise else t.rowwise_tensor
-    return t.data.reshape(E, m, n), t.scale_inv.reshape(-1)[: E * m * n // 32]
-
-
 def _ep_overlap_fc1_weight(wi, native_layout):
     """FC1 weights as the overlap GEMM reads them: [E, 2F, H], gate/up in 32-row blocks."""
     if native_layout:
@@ -2460,31 +2444,40 @@ def _ep_overlap_fwd(
                 counts,
                 offsets,
                 handle_mem,
-            ) = tex_ep_overlap.ep_dispatch_gemm_fwd_mxfp8(
-                idx, tok_q, tok_s, tw, w1_q, w1_s, recv_capacity=recv_pr, alignment=align
+            ) = tex_ep_overlap.ep_dispatch_gemm_fwd(
+                idx,
+                tok_q,
+                tw,
+                w1_q,
+                recv_capacity=recv_pr,
+                alignment=align,
+                tokens_scale_inv=tok_s,
+                w1_scale_inv=w1_s,
+                scaling_mode=ScalingMode.MXFP8_1D_SCALING,
             )
-            out = tex_ep_overlap.ep_combine_gemm_fwd_mxfp8(
+            out = tex_ep_overlap.ep_combine_gemm_fwd(
                 handle_mem,
                 act_q,
-                act_s,
                 recv_w,
                 offsets,
                 w2_q,
-                w2_s,
                 num_tokens=T,
                 top_k=K,
                 alignment=align,
+                act_out_scale_inv=act_s,
+                w2_scale_inv=w2_s,
+                scaling_mode=ScalingMode.MXFP8_1D_SCALING,
             ).astype(x_l.dtype)
             # The MXFP8 backward recomputes the activation; keep the received rows' scales instead.
             act_out = recv_scale
         else:
-            recv_tokens, recv_w, gemm_out, act_out, counts, offsets, handle_mem = (
+            recv_tokens, _, recv_w, gemm_out, act_out, _, counts, offsets, handle_mem = (
                 tex_ep_overlap.ep_dispatch_gemm_fwd(
                     idx, tokens, tw, w1_l, recv_capacity=recv_pr, alignment=align
                 )
             )
             out = tex_ep_overlap.ep_combine_gemm_fwd(
-                handle_mem, act_out, offsets, w2_l, num_tokens=T, top_k=K, alignment=align
+                handle_mem, act_out, recv_w, offsets, w2_l, num_tokens=T, top_k=K, alignment=align
             )
             weight_res = (w1_l, w2_l)
         total = offsets[-1:]
@@ -2554,40 +2547,42 @@ def _ep_overlap_bwd(
             # ao holds the received rows' compact scales (see _ep_overlap_fwd).
             dy_q, dy_s = _ep_overlap_mxfp8_rows(dy)
             w1_c, w1_cs, w2_c, w2_cs = ws  # columnwise MXFP8 weights saved by the forward
-            ggo, ggo_s, ggo_c, ggo_cs, grad_recv_w, d_w2 = tex_ep_overlap.ep_combine_gemm_bwd_mxfp8(
+            ggo, ggo_s, ggo_c, ggo_cs, grad_recv_w, d_w2 = tex_ep_overlap.ep_combine_gemm_bwd(
                 hm,
                 dy_q,
-                dy_s,
                 go,
                 rw,
                 cnt,
                 w2_c,
-                w2_cs,
                 top_k=K,
                 alignment=align,
+                dy_scale_inv=dy_s,
+                w2_scale_inv=w2_cs,
                 weight_grad_dtype=wgrad_dtype,
+                scaling_mode=ScalingMode.MXFP8_1D_SCALING,
             )
-            grad_tokens, grad_topk, d_w1 = tex_ep_overlap.ep_dispatch_gemm_bwd_mxfp8(
+            grad_tokens, grad_topk, d_w1 = tex_ep_overlap.ep_dispatch_gemm_bwd(
                 hm,
                 ggo,
-                ggo_s,
-                ggo_c,
-                ggo_cs,
                 grad_recv_w,
                 cnt,
                 w1_c,
-                w1_cs,
                 rt,
-                ao,
                 num_tokens=T,
                 top_k=K,
                 alignment=align,
+                grad_gemm_out_scale_inv=ggo_s,
+                grad_gemm_out_col=ggo_c,
+                grad_gemm_out_col_scale_inv=ggo_cs,
+                w1_scale_inv=w1_cs,
+                recv_scale_inv=ao,
                 weight_grad_dtype=wgrad_dtype,
+                scaling_mode=ScalingMode.MXFP8_1D_SCALING,
             )
         else:
             w1_l, w2_l = ws
-            grad_gemm_out, grad_recv_w, d_w2 = tex_ep_overlap.ep_combine_gemm_bwd(
-                hm, dy, go, rw, cnt, w2_l, ao, top_k=K, alignment=align
+            grad_gemm_out, _, _, _, grad_recv_w, d_w2 = tex_ep_overlap.ep_combine_gemm_bwd(
+                hm, dy, go, rw, cnt, w2_l, top_k=K, alignment=align, wgrad_input=ao
             )
             grad_tokens, grad_topk, d_w1 = tex_ep_overlap.ep_dispatch_gemm_bwd(
                 hm,

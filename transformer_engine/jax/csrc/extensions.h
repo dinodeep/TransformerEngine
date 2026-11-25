@@ -248,10 +248,6 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmFwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmFwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmBwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmBwdHandler);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmFwdMxfp8Handler);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmFwdMxfp8Handler);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(EpCombineGemmBwdMxfp8Handler);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(EpDispatchGemmBwdMxfp8Handler);
 
 // EP-specific execute stage of the borrowed-comm bootstrap op (see
 // tex.ep.use_nccl_comm_from_xla). The prepare stage is the generic

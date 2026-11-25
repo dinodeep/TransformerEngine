@@ -18,6 +18,7 @@ Flax ``_MoEBlock`` is checked to be bitwise identical to ``moe()`` for the same 
 """
 
 import os
+import re
 import sys
 import warnings
 
@@ -354,6 +355,21 @@ def _assert_same(test, ref, key, enable=False):
         np.testing.assert_array_equal(_global(test), _global(ref), err_msg=key)
 
 
+MXFP8_SCALING_MODE = 2  # ScalingMode.MXFP8_1D_SCALING.value
+NO_SCALING_MODE = 0  # ScalingMode.NO_SCALING.value
+
+
+def _overlap_scaling_modes(hlo):
+    """{overlap FFI target: set of its scaling_mode attribute values} in lowered StableHLO text."""
+    modes = {}
+    for line in hlo.splitlines():
+        for target in OVERLAP_TARGETS:
+            if f"@{target}(" in line:
+                m = re.search(r"scaling_mode = (\d+)", line)
+                modes.setdefault(target, set()).add(int(m.group(1)) if m else None)
+    return modes
+
+
 def _hlo(fn, *args):
     return fn.lower(*args).as_text()
 
@@ -398,8 +414,11 @@ def test_moe_overlap_matches_flag_off(layout, score_function, weight_layout):
         assert not any("EP overlap skipped" in m for m in messages), messages
         assert any("default layout" in m for m in messages) == (weight_layout == "default")
         hlo = _hlo(on_fn, params, x)
+        modes = _overlap_scaling_modes(hlo)
         for target in OVERLAP_TARGETS:
-            assert target in hlo, f"{target} missing: the overlap path did not run"
+            assert modes.get(target) == {
+                NO_SCALING_MODE
+            }, f"{target}: scaling modes {modes.get(target)}; the BF16 overlap path did not run"
         assert "te_ep_dispatch_gemm_fwd_ffi" not in _hlo(ref_fn, ref_params, x)
         gp = _from_layout(gp, weight_layout)
 
@@ -678,9 +697,11 @@ def test_mxfp8_overlap_matches_flag_off(layout, quant_before_fsdp_ag):
         bf16_block = on_block.clone(quantization_recipe=None, quant_before_fsdp_ag=False)
         _, b_out, b_gp, b_gx = run(bf16_block)
         hlo = on_fn.lower(variables, x).as_text()
+        modes = _overlap_scaling_modes(hlo)
         for target in OVERLAP_TARGETS:
-            mx = target.replace("_ffi", "_mxfp8_ffi")
-            assert mx in hlo, f"{mx} missing: the MXFP8 overlap path did not run"
+            assert modes.get(target) == {
+                MXFP8_SCALING_MODE
+            }, f"{target}: scaling modes {modes.get(target)}; the MXFP8 overlap path did not run"
 
     def errs_of(o, g, gx_, r_out, r_gp, r_gx):
         return {

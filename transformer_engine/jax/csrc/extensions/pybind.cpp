@@ -153,18 +153,6 @@ pybind11::dict Registrations() {
   dict["te_ep_dispatch_gemm_bwd_ffi"] =
       pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
                      pybind11::arg("execute") = EncapsulateFFI(EpDispatchGemmBwdHandler));
-  dict["te_ep_dispatch_gemm_fwd_mxfp8_ffi"] =
-      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
-                     pybind11::arg("execute") = EncapsulateFFI(EpDispatchGemmFwdMxfp8Handler));
-  dict["te_ep_combine_gemm_fwd_mxfp8_ffi"] =
-      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
-                     pybind11::arg("execute") = EncapsulateFFI(EpCombineGemmFwdMxfp8Handler));
-  dict["te_ep_combine_gemm_bwd_mxfp8_ffi"] =
-      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
-                     pybind11::arg("execute") = EncapsulateFFI(EpCombineGemmBwdMxfp8Handler));
-  dict["te_ep_dispatch_gemm_bwd_mxfp8_ffi"] =
-      pybind11::dict(pybind11::arg("instantiate") = EncapsulateFFI(EpInstantiateHandler),
-                     pybind11::arg("execute") = EncapsulateFFI(EpDispatchGemmBwdMxfp8Handler));
 
   // Borrowed-comm bootstrap: a one-shot op requests the collective clique
   // (generic prepare) and initializes EPBackend from the borrowed comm (EP
