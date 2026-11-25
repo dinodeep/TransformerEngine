@@ -129,8 +129,8 @@ class _MoEBlock(TransformerEngineBase):
     enable_ep_overlap : bool
         Overlap the EP dispatch/combine with the expert grouped GEMMs (NCCL EP + CuTeDSL
         readiness signals, forward and backward). Needs ``NVTE_ENABLE_CUTEDSL_BACKEND=1`` and
-        ``NVTE_MOE_OVERLAP``; BF16, SwiGLU, no biases, hidden a multiple of 256 and
-        ``intermediate_size`` a multiple of 64. Ineligible layers warn and use the regular path.
+        ``NVTE_MOE_OVERLAP`` (else TE raises at trace time); see :func:`moe` for the other
+        requirements. There is no fallback: unmet requirements raise.
         Default ``False``.
     cudnn_native_weight_layout : bool
         Store ``wi`` as ``[E, 2 * intermediate_size, hidden]`` with gate/up in alternating 32-row

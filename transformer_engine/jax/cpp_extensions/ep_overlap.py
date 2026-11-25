@@ -34,8 +34,7 @@ from .misc import jax_dtype_to_te_dtype
 from ..quantize import ScalingMode
 
 __all__ = [
-    "ep_overlap_built",
-    "ep_overlap_env_reason",
+    "check_ep_overlap_sms_env",
     "ep_overlap_workspace_size",
     "ep_dispatch_gemm_fwd",
     "ep_combine_gemm_fwd",
@@ -44,28 +43,27 @@ __all__ = [
 ]
 
 
-def ep_overlap_built() -> bool:
-    """True when the JAX extension has the overlap FFI targets."""
-    return hasattr(transformer_engine_jax, "ep_overlap_workspace_size")
+# NCCL EP's SM overrides; the overlap path sizes its GEMM/communication SM split from
+# ep_bootstrap(max_num_sms=...) and cannot honour them.
+NCCL_EP_SMS_ENV_VARS = (
+    "NCCL_EP_COMM_SMS",
+    "NCCL_EP_DISPATCH_SMS",
+    "NCCL_EP_COMBINE_SMS",
+    "NCCL_EP_DISPATCH_BWD_SMS",
+    "NCCL_EP_COMBINE_BWD_SMS",
+)
 
 
-def ep_overlap_env_reason():
-    """None when the runtime environment enables the overlap GEMMs, else the reason."""
-    if os.environ.get("NVTE_ENABLE_CUTEDSL_BACKEND", "0") != "1":
-        return "needs NVTE_ENABLE_CUTEDSL_BACKEND=1"
-    path = os.environ.get("NVTE_MOE_OVERLAP", "")
-    if not path or not os.path.isdir(path):
-        return "needs NVTE_MOE_OVERLAP pointing at the EPCompOverlap gemm/ tree"
-    for var in (
-        "NCCL_EP_COMM_SMS",
-        "NCCL_EP_DISPATCH_SMS",
-        "NCCL_EP_COMBINE_SMS",
-        "NCCL_EP_DISPATCH_BWD_SMS",
-        "NCCL_EP_COMBINE_BWD_SMS",
-    ):
-        if os.environ.get(var):
-            return f"{var} must be unset (use ep_bootstrap(max_num_sms=...))"
-    return None
+def check_ep_overlap_sms_env():
+    """Raise when an NCCL EP SM override is set: the overlapped GEMMs run on the SMs NCCL EP
+    leaves free, so the split must come from ep_bootstrap(max_num_sms=...) alone."""
+    overrides = [var for var in NCCL_EP_SMS_ENV_VARS if os.environ.get(var)]
+    if overrides:
+        raise ValueError(
+            f"enable_ep_overlap=True cannot run with {', '.join(overrides)} set: the overlapped"
+            " GEMMs use the SMs NCCL EP leaves free, so the SM split must come from"
+            " ep_bootstrap(max_num_sms=...). Unset these variables or disable the overlap."
+        )
 
 
 @functools.lru_cache(maxsize=None)

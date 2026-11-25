@@ -45,6 +45,7 @@ then tears down EP and runs all cuDNN cases in the same processes:
 
 import importlib
 import os
+import re
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
@@ -185,6 +186,29 @@ GRAD_GATE_TOLERANCE = {
 # the bf16-rounded softmax inside the topk kernel.
 AUX_TOLERANCE = {"atol": 1e-6, "rtol": 1e-6}
 
+# EP/GEMM overlap arm (enable_ep_overlap=True): the CuTeDSL GEMMs round differently from TE's
+# grouped GEMM, and the routing-weight gradient is reduced with float32 atomics, so its gradients
+# (gate, d_x) are reproducible only to reduction order. Same reference, wider bounds.
+OVERLAP_FWD_TOLERANCE = {
+    "bf16": {"atol": 4e-3, "rtol": 4e-3},
+    "mxfp8": {"atol": 1.5e-2, "rtol": 1.5e-2},
+}
+OVERLAP_GRAD_TOLERANCE = {
+    "bf16": {"atol": 2e-6, "rtol": 2e-2},
+    "mxfp8": {"atol": 4e-6, "rtol": 4e-2},
+}
+# Communication SMs per NCCL EP call; the overlap path needs an explicit ep_bootstrap budget.
+OVERLAP_COMM_SMS = 24
+# The overlap arm's FFN size: MXFP8 overlap needs a multiple of 256 (768 keeps FC1 non-square).
+OVERLAP_INTER = 768
+OVERLAP_TARGETS = tuple(
+    f"te_ep_{op}_gemm_{direction}_ffi"
+    for direction in ("fwd", "bwd")
+    for op in ("dispatch", "combine")
+)
+# ScalingMode values the overlap custom calls carry as their scaling_mode attribute.
+OVERLAP_SCALING_MODE = {"bf16": 0, "mxfp8": 2}
+
 
 # -----------------------------------------------------------------------------
 # Fixtures
@@ -235,6 +259,8 @@ def mesh(use_cudnn_fusion):
             recv_capacity_per_rank=recv_capacity_per_rank,
             hidden_dim=HIDDEN,
             max_token_dtype=DTYPE,
+            num_topk=TOPK,
+            max_num_sms=OVERLAP_COMM_SMS,
         )
     record_ep_bootstrap_signature_for_moe(
         num_experts=NUM_EXPERTS,
@@ -402,12 +428,15 @@ def _make_block(
     quant_before_fsdp_ag=False,
     mesh_resource=None,
     dispatch_quantization_recipe=None,
+    enable_ep_overlap=False,
+    intermediate_size=INTER,
     use_cudnn_fusion,
 ):
     kwargs = dict(
         num_experts=NUM_EXPERTS,
         num_experts_per_tok=TOPK,
-        intermediate_size=INTER,
+        intermediate_size=intermediate_size,
+        enable_ep_overlap=enable_ep_overlap,
         mesh_resource=mesh_resource,
         apply_topk_weights_early=apply_topk_weights_early,
         aux_loss_coeff=aux_loss_coeff,
@@ -475,14 +504,47 @@ def _ctx(mesh):
     return _Combo()
 
 
-def _init_apply(block, mesh, x, key):
+def _init_apply(block, mesh, x, key, *, return_hlo=False):
     with _ctx(mesh):
         x_sh = _shard_inputs(x, mesh)
         variables = jax.jit(block.init)(key, x_sh)
         jax.block_until_ready(jax.tree_util.tree_leaves(variables)[0])
-        output, aux, _trt, expert_counts = jax.jit(block.apply)(variables, x_sh)
+        apply_fn = jax.jit(block.apply)
+        output, aux, _trt, expert_counts = apply_fn(variables, x_sh)
         jax.block_until_ready(output)
+        if return_hlo:
+            return variables, output, aux, expert_counts, apply_fn.lower(variables, x_sh).as_text()
     return variables, output, aux, expert_counts
+
+
+def _skip_unless_overlap_available(ep_overlap, use_cudnn_fusion):
+    """Skip the overlap arm cleanly when its prerequisites are missing."""
+    if not ep_overlap:
+        return
+    if use_cudnn_fusion:
+        pytest.skip("the EP/GEMM overlap replaces the unfused path only")
+    import transformer_engine_jax
+
+    if not hasattr(transformer_engine_jax, "ep_overlap_workspace_size"):
+        pytest.skip("TE was built without the EP/GEMM overlap")
+    if os.environ.get("NVTE_ENABLE_CUTEDSL_BACKEND") != "1" or not os.path.isdir(
+        os.environ.get("NVTE_MOE_OVERLAP", "")
+    ):
+        pytest.skip("the EP/GEMM overlap needs NVTE_ENABLE_CUTEDSL_BACKEND=1 and NVTE_MOE_OVERLAP")
+
+
+def _assert_overlap_ran(hlo, quantization, directions=("fwd", "bwd")):
+    """Every overlap custom call of ``directions`` is in the lowered HLO with the expected
+    scaling_mode, so a silent fallback to the non-overlapped path fails the test."""
+    modes = {}
+    for line in hlo.splitlines():
+        for target in OVERLAP_TARGETS:
+            if f"@{target}(" in line:
+                m = re.search(r"scaling_mode = (\d+)", line)
+                modes.setdefault(target, set()).add(int(m.group(1)) if m else None)
+    for target in OVERLAP_TARGETS:
+        if target.rsplit("_", 2)[-2] in directions:
+            assert modes.get(target) == {OVERLAP_SCALING_MODE[quantization]}, (target, modes)
 
 
 def _grad_step(
@@ -492,6 +554,7 @@ def _grad_step(
     x,
     *,
     include_aux=False,
+    return_hlo=False,
 ):
     """Run jax.grad of mean(out^2) [+ aux if include_aux] vs (params, x).
 
@@ -509,9 +572,12 @@ def _grad_step(
                 loss = loss + aux.astype(jnp.float32)
             return loss
 
-        grads_v, grad_x = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(variables, x_sh)
+        grad_fn = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))
+        grads_v, grad_x = grad_fn(variables, x_sh)
         jax.block_until_ready(jax.tree_util.tree_leaves(grads_v)[0])
         jax.block_until_ready(grad_x)
+        if return_hlo:
+            return grads_v, grad_x, grad_fn.lower(variables, x_sh).as_text()
         return grads_v, grad_x
 
 
@@ -750,10 +816,23 @@ class TestTeEpMoeForward:
 
     @pytest.mark.parametrize("config", _CONFIGS)
     @pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
-    def test_forward(self, mesh, config, quantization, make_block):
-        block = make_block(**config, quantization_recipe=_quantization_recipe(quantization))
+    @pytest.mark.parametrize("ep_overlap", [False, True], ids=["no_overlap", "overlap"])
+    def test_forward(self, mesh, config, quantization, ep_overlap, make_block, use_cudnn_fusion):
+        _skip_unless_overlap_available(ep_overlap, use_cudnn_fusion)
+        block = make_block(
+            **config,
+            quantization_recipe=_quantization_recipe(quantization),
+            enable_ep_overlap=ep_overlap,
+            intermediate_size=OVERLAP_INTER if ep_overlap else INTER,
+        )
         x = _make_inputs(jax.random.PRNGKey(0))
-        variables, output, aux, expert_counts = _init_apply(block, mesh, x, jax.random.PRNGKey(1))
+        variables, output, aux, expert_counts, hlo = _init_apply(
+            block, mesh, x, jax.random.PRNGKey(1), return_hlo=True
+        )
+        if ep_overlap:
+            _assert_overlap_ran(hlo, quantization, directions=("fwd",))
+        else:
+            assert "te_ep_dispatch_gemm_fwd_ffi" not in hlo
 
         # Shape / dtype / finiteness (cheap; on the local shard).
         assert output.shape == x.shape
@@ -783,8 +862,11 @@ class TestTeEpMoeForward:
         np.testing.assert_allclose(
             out_te_np.astype(np.float32),
             np.asarray(jax.device_get(out_ref)).astype(np.float32),
-            **FWD_TOLERANCE[quantization],
-            err_msg=f"forward parity breach for config={config}, quantization={quantization}",
+            **(OVERLAP_FWD_TOLERANCE if ep_overlap else FWD_TOLERANCE)[quantization],
+            err_msg=(
+                f"forward parity breach for config={config}, quantization={quantization},"
+                f" ep_overlap={ep_overlap}"
+            ),
         )
 
 
@@ -1087,11 +1169,20 @@ class TestTeEpMoeBackward:
 
     @pytest.mark.parametrize("config", _CONFIGS)
     @pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
-    def test_backward(self, mesh, config, quantization, make_block):
-        block = make_block(**config, quantization_recipe=_quantization_recipe(quantization))
+    @pytest.mark.parametrize("ep_overlap", [False, True], ids=["no_overlap", "overlap"])
+    def test_backward(self, mesh, config, quantization, ep_overlap, make_block, use_cudnn_fusion):
+        _skip_unless_overlap_available(ep_overlap, use_cudnn_fusion)
+        block = make_block(
+            **config,
+            quantization_recipe=_quantization_recipe(quantization),
+            enable_ep_overlap=ep_overlap,
+            intermediate_size=OVERLAP_INTER if ep_overlap else INTER,
+        )
         x = _make_inputs(jax.random.PRNGKey(2))
         variables, _, _, _ = _init_apply(block, mesh, x, jax.random.PRNGKey(3))
-        grads_te, grad_x_te = _grad_step(block, variables, mesh, x)
+        grads_te, grad_x_te, hlo = _grad_step(block, variables, mesh, x, return_hlo=True)
+        if ep_overlap:
+            _assert_overlap_ran(hlo, quantization)
 
         # Reference grads via jax.grad over the pure-JAX MoE with the
         # same config. argnums=(0, 1) so the reference also produces a
@@ -1127,6 +1218,8 @@ class TestTeEpMoeBackward:
             assert np.all(np.isfinite(g_te)), f"{name} grad has NaN/Inf [config={config}]"
             assert np.any(g_te != 0.0), f"{name} grad identically zero [config={config}]"
             tolerances = GRAD_GATE_TOLERANCE if name == "gate_kernel" else GRAD_FFN_TOLERANCE
+            if ep_overlap:
+                tolerances = OVERLAP_GRAD_TOLERANCE
             np.testing.assert_allclose(
                 g_te.astype(np.float32),
                 grads_ref_np[name].astype(np.float32),
@@ -1153,7 +1246,7 @@ class TestTeEpMoeBackward:
         np.testing.assert_allclose(
             grad_x_te_np.astype(np.float32),
             grad_x_ref_np.astype(np.float32),
-            **GRAD_FFN_TOLERANCE[quantization],
+            **(OVERLAP_GRAD_TOLERANCE if ep_overlap else GRAD_FFN_TOLERANCE)[quantization],
             err_msg=f"d_x parity breach [config={config}, quantization={quantization}]",
         )
 
@@ -1181,6 +1274,86 @@ def test_ep_checkpoint_names(mesh, monkeypatch, make_block):
     assert np.all(np.isfinite(_to_global_numpy(grad_inputs, mesh)))
     for name in ("gate_kernel", "wi", "wo"):
         assert np.all(np.isfinite(_to_global_numpy(_unwrap(grads["params"][name]), mesh)))
+
+
+@pytest.mark.parametrize(
+    "block_kwargs, env, match",
+    [
+        pytest.param(dict(dispatch_checkpoint_name="moe_dispatch"), {}, "checkpoint", id="ckpt"),
+        pytest.param(dict(quantization="mxfp8", intermediate_size=INTER), {}, "of 256", id="ffn"),
+        pytest.param(dict(quant_before_fsdp_ag=True), {}, "MXFP8 recipe", id="qbfag_bf16"),
+        pytest.param({}, {"NCCL_EP_COMM_SMS": "8"}, "NCCL_EP_COMM_SMS", id="nccl_ep_sms"),
+    ],
+)
+def test_ep_overlap_unmet_requirement_raises(
+    mesh, monkeypatch, make_block, use_cudnn_fusion, block_kwargs, env, match
+):
+    """enable_ep_overlap=True never falls back: an unmet requirement raises at trace time."""
+    _skip_unless_overlap_available(True, use_cudnn_fusion)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    kwargs = {"intermediate_size": OVERLAP_INTER, **block_kwargs}
+    kwargs["quantization_recipe"] = _quantization_recipe(kwargs.pop("quantization", "bf16"))
+    with pytest.raises(ValueError, match=match):
+        _init_apply(
+            make_block(enable_ep_overlap=True, **kwargs),
+            mesh,
+            _make_inputs(jax.random.PRNGKey(36)),
+            jax.random.PRNGKey(37),
+        )
+
+
+def test_ep_overlap_no_kernel_compile_at_execution(mesh, make_block, use_cudnn_fusion):
+    """The CuTeDSL GEMMs compile while jit traces (nvte_ep_overlap_compile); executing the
+    compiled step, first and later, never re-enters the Python compile/register entry points."""
+    _skip_unless_overlap_available(True, use_cudnn_fusion)
+    import tvm_ffi
+    from transformer_engine.common.CuTeDSL.ep_gemm import (
+        combine_gemm,
+        dispatch_gemm,
+        requantize,
+        wgrad_gemm,
+    )
+
+    entry_points = (
+        dispatch_gemm.get_ep_dispatch_gemm_function,
+        dispatch_gemm.get_ep_dispatch_gemm_workspace_layout,
+        combine_gemm.get_ep_combine_gemm_function,
+        combine_gemm.get_ep_combine_gemm_workspace_layout,
+        wgrad_gemm.get_ep_wgrad_function,
+        wgrad_gemm.get_ep_wgrad_workspace_layout,
+        wgrad_gemm.get_ep_wgrad_reads_descriptors,
+        requantize.get_ep_requant_function,
+    )
+    calls = []
+    for fn in entry_points:
+
+        def counted(*args, _fn=fn):
+            calls.append(_fn.__name__)
+            return _fn(*args)
+
+        tvm_ffi.register_global_func(fn.__name__, counted, override=True)
+    try:
+        # An FFN size no other test uses, so this layer's GEMM configurations are new.
+        block = make_block(enable_ep_overlap=True, intermediate_size=OVERLAP_INTER + 256)
+        x = _make_inputs(jax.random.PRNGKey(38))
+        with _ctx(mesh):
+            x_sh = _shard_inputs(x, mesh)
+            before = len(calls)
+            variables = jax.jit(block.init)(jax.random.PRNGKey(39), x_sh)
+
+            def loss_fn(variables, x):
+                return jnp.mean(block.apply(variables, x)[0].astype(jnp.float32) ** 2)
+
+            compiled = jax.jit(jax.grad(loss_fn, argnums=(0, 1))).lower(variables, x_sh).compile()
+            after_compile = len(calls)
+            for _ in range(3):
+                jax.block_until_ready(compiled(variables, x_sh))
+    finally:
+        for fn in entry_points:
+            tvm_ffi.register_global_func(fn.__name__, fn, override=True)
+    assert after_compile > before, "the new GEMM configuration was not compiled at trace time"
+    assert len(calls) == after_compile, f"compiled/looked up at execution: {calls[after_compile:]}"
 
 
 def test_explicitly_disabled_fusion_with_native_weights(

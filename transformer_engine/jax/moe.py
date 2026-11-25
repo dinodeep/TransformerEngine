@@ -40,7 +40,6 @@ stateful recipes follow the same update semantics as the other TE MLPs.
 """
 
 import math
-import os
 import warnings
 from dataclasses import replace
 from functools import partial
@@ -2189,7 +2188,7 @@ _EP_OVERLAP_SM_ARCHS = (100, 103, 107)
 _EP_OVERLAP_OFF, _EP_OVERLAP_ON, _EP_OVERLAP_FC2_NATIVE = 0, 1, 2
 
 
-def _ep_overlap_rejection_reasons(
+def _ep_overlap_errors(
     x,
     router_info,
     wi,
@@ -2209,90 +2208,81 @@ def _ep_overlap_rejection_reasons(
     wi_kernel_axes=(),
     wo_kernel_axes=(),
 ) -> list:
-    """Reasons this call cannot use the EP/GEMM overlap path (empty when it can)."""
+    """Unmet requirements of the EP/GEMM overlap path for this call (empty when it can run).
+    With ``enable_ep_overlap=True``, moe() raises on any of them: there is no fallback."""
     from transformer_engine_jax import get_device_compute_capability
 
-    reasons = []
-    if not tex_ep_overlap.ep_overlap_built():
-        reasons.append("the TE JAX extension was built without the EP overlap FFI")
-    env_reason = tex_ep_overlap.ep_overlap_env_reason()
-    if env_reason is not None:
-        reasons.append(env_reason)
+    errors = []
     try:
         capability = get_device_compute_capability(0)
         if capability not in _EP_OVERLAP_SM_ARCHS:
-            reasons.append(f"needs SM 10.0, 10.3 or 10.7, got SM{capability}")
+            errors.append(f"needs SM 10.0, 10.3 or 10.7, got SM{capability}")
     except RuntimeError as exc:
-        reasons.append(f"could not query GPU compute capability: {exc}")
-    if os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1") == "0":
-        reasons.append(
-            "deterministic execution was requested, and the routing-weight gradient is reduced"
-            " with atomics"
-        )
+        errors.append(f"could not query GPU compute capability: {exc}")
     if x.dtype != jnp.bfloat16:
-        reasons.append(f"needs BF16 activations, got {x.dtype}")
+        errors.append(f"needs BF16 activations, got {x.dtype}")
     if wi.dtype != jnp.bfloat16:
-        reasons.append(f"needs BF16 weights, got {wi.dtype}")
+        errors.append(f"needs BF16 weights, got {wi.dtype}")
     if any(b is not None for b in (wi_0_bias, wi_1_bias, wo_bias)):
-        reasons.append("biases are not supported")
+        errors.append("FFN biases are not supported")
     if str(activation_type).lower() != "silu":
-        reasons.append("needs activation_type='silu' (SwiGLU)")
+        errors.append(f"needs activation_type='silu' (SwiGLU), got {activation_type!r}")
     mxfp8, mxfp8_reasons = _ep_overlap_recipe(quantizer_sets, dispatch_quantizer)
-    reasons.extend(mxfp8_reasons)
+    errors.extend(mxfp8_reasons)
     if quant_before_fsdp_ag:
         if not mxfp8:
-            reasons.append("quant_before_fsdp_ag needs the MXFP8 recipe")
+            errors.append("quant_before_fsdp_ag needs the MXFP8 recipe")
         elif _ep_overlap_quant_gather_axis(mesh_resource, wi_kernel_axes, wo_kernel_axes) is None:
-            reasons.append(
+            errors.append(
                 "quant_before_fsdp_ag needs the expert dimension of wi and wo sharded over (ep,"
                 " fsdp) (e.g. logical rule exp -> (ep, fsdp)); hidden-dim FSDP is not supported"
             )
     if any(n is not None for n in checkpoint_names):
-        reasons.append("checkpoint names are not supported")
+        errors.append("TE checkpoint (remat) names are not supported")
     hidden = x.shape[-1]
     if mxfp8 and hidden % 512:
-        reasons.append(f"MXFP8 needs hidden_dim a multiple of 512, got {hidden}")
+        errors.append(f"MXFP8 needs hidden_dim a multiple of 512, got {hidden}")
     if hidden % 256:
-        reasons.append(f"hidden_dim must be a multiple of 256, got {hidden}")
+        errors.append(f"hidden_dim must be a multiple of 256, got {hidden}")
     ffn = wo_ffn = None
     if wi.ndim == 3:
         ffn = (wi.shape[2] if wi.shape[1] == hidden else wi.shape[1]) // 2
     if mxfp8 and (ffn is None or ffn % 256):
-        reasons.append(f"MXFP8 needs ffn_hidden_size a multiple of 256, got {ffn}")
+        errors.append(f"MXFP8 needs ffn_hidden_size a multiple of 256, got {ffn}")
     if mxfp8 and not use_cudnn_fusion and _ALIGN_SIZE < 128:
-        reasons.append("MXFP8 needs an EP alignment of at least 128")
+        errors.append("MXFP8 needs an EP alignment of at least 128")
     if ffn is None or ffn % 64:
-        reasons.append(f"ffn_hidden_size must be a multiple of 64, got {ffn}")
+        errors.append(f"ffn_hidden_size must be a multiple of 64, got {ffn}")
     del wo_ffn
     alignment = _CUDNN_JAX_ALIGN_SIZE if use_cudnn_fusion else _ALIGN_SIZE
     if recv_capacity_per_rank is not None and int(recv_capacity_per_rank) % 256:
-        reasons.append(
+        errors.append(
             f"recv_capacity_per_rank must be a multiple of 256, got {recv_capacity_per_rank}"
         )
     if alignment not in (64, 128, 256):
-        reasons.append("the EP alignment must be one of (64, 128, 256)")
+        errors.append("the EP alignment must be one of (64, 128, 256)")
     ep_axis = mesh_resource.ep_resource
     mesh = _get_mesh()
     if mesh is None or mesh.empty or ep_axis not in mesh.shape:
-        reasons.append("needs an active mesh with the EP axis")
+        errors.append("needs an active mesh with the EP axis")
     elif num_experts % mesh.shape[ep_axis]:
-        reasons.append("num_experts must be divisible by the EP size")
+        errors.append("num_experts must be divisible by the EP size")
     try:
         from .ep import ep_overlap_comm_sms, ep_overlap_num_topk
 
         if ep_overlap_num_topk() != _num_experts_per_tok(router_info):
-            reasons.append(
+            errors.append(
                 "ep_bootstrap(num_topk=...) must equal the layer's top-k"
                 f" ({_num_experts_per_tok(router_info)}), got {ep_overlap_num_topk()}: NCCL EP"
                 " needs it for the pull-push flow whose readiness signals the GEMMs follow"
             )
         if ep_overlap_comm_sms() <= 0:
-            reasons.append(
+            errors.append(
                 "ep_bootstrap ran without communication SMs for the overlap; pass max_num_sms > 0"
             )
     except RuntimeError as exc:
-        reasons.append(str(exc))
-    return reasons
+        errors.append(str(exc))
+    return errors
 
 
 def _ep_overlap_quant_gather_axis(mesh_resource, wi_kernel_axes, wo_kernel_axes):
@@ -2803,10 +2793,14 @@ def moe(
         ``None`` (no dispatch quantization).
     enable_ep_overlap : bool
         Run dispatch -> FC1 -> SwiGLU -> FC2 -> combine and its backward as NCCL EP calls
-        overlapped with CuTeDSL grouped GEMMs (device readiness signals; ep_gemm.h). Needs
-        ``NVTE_ENABLE_CUTEDSL_BACKEND=1``, ``NVTE_MOE_OVERLAP``, ``ep_bootstrap(num_topk=top_k)``,
-        BF16, SwiGLU, no biases, hidden % 256 == 0 and FFN % 64 == 0; other calls warn and run the
-        regular path. Matches the regular path within BF16 rounding (the routing weight is applied
+        overlapped with CuTeDSL grouped GEMMs (device readiness signals; ep_gemm.h). There is no
+        fallback: the call runs the overlap or raises. Requirements: SM 10.0/10.3/10.7;
+        ``NVTE_ENABLE_CUTEDSL_BACKEND=1`` and ``NVTE_MOE_OVERLAP`` (else TE raises while the GEMMs
+        compile at trace time); no ``NCCL_EP_*_SMS`` override;
+        ``ep_bootstrap(num_topk=top_k, max_num_sms>0)``; BF16 or MXFP8 (E4M3) recipe; BF16
+        inputs and weights; SwiGLU; no biases or checkpoint names; hidden % 256 == 0 and
+        FFN % 64 == 0 (MXFP8: 512 and 256); recv_capacity_per_rank % 256 == 0. Matches the
+        regular path within BF16 rounding (the routing weight is applied
         before FC2). Defaults to ``False``.
     fc2_native_weight_layout : bool
         ``True`` selects FC2 storage ``wo`` [E, H, F] (the overlap GEMM's layout) instead of
@@ -2828,9 +2822,8 @@ def moe(
     in both forward and backward, independently of an enclosing global context.
 
     ``enable_ep_overlap=True`` runs dispatch -> FC1 -> SwiGLU -> FC2 -> combine (and the backward)
-    as NCCL EP calls overlapped with CuTeDSL grouped GEMMs (needs NVTE_ENABLE_CUTEDSL_BACKEND=1,
-    NVTE_MOE_OVERLAP, BF16, SwiGLU, no biases, hidden % 256 == 0, FFN % 64 == 0). Ineligible calls
-    warn and run the regular path. The overlap GEMMs read FC1 as [E, 2F, H] (gate/up in 32-row
+    as NCCL EP calls overlapped with CuTeDSL grouped GEMMs (see ``enable_ep_overlap`` for the
+    requirements; unmet ones raise). The overlap GEMMs read FC1 as [E, 2F, H] (gate/up in 32-row
     blocks, i.e. ``cudnn_native_weight_layout=True``) and FC2 as [E, H, F]
     (``fc2_native_weight_layout=True``); weights stored in other layouts are converted every pass.
 
@@ -2902,7 +2895,8 @@ def moe(
 
         use_ep_overlap = _EP_OVERLAP_OFF
         if enable_ep_overlap:
-            overlap_reasons = _ep_overlap_rejection_reasons(
+            tex_ep_overlap.check_ep_overlap_sms_env()
+            overlap_errors = _ep_overlap_errors(
                 x,
                 router_info,
                 wi,
@@ -2926,29 +2920,20 @@ def moe(
                     dispatch_checkpoint_name,
                 ),
             )
-            if overlap_reasons:
+            if overlap_errors:
+                raise ValueError("enable_ep_overlap=True: " + "; ".join(overlap_errors))
+            use_ep_overlap = _EP_OVERLAP_FC2_NATIVE if fc2_native_weight_layout else _EP_OVERLAP_ON
+            use_cudnn_jax_fusion = False
+            if not (cudnn_native_weight_layout and fc2_native_weight_layout):
                 warnings.warn(
-                    "enable_ep_overlap=True: EP overlap skipped, running the non-overlapped TE EP"
-                    " MoE path: "
-                    + "; ".join(overlap_reasons),
+                    "enable_ep_overlap=True with weights stored in the default layout: the"
+                    " overlap GEMMs read wi as [E, 2F, H] (cudnn_native_weight_layout=True) and"
+                    " wo as [E, H, F] (fc2_native_weight_layout=True), so each pass converts"
+                    " the weights in the graph (one weight-sized copy each way), which can"
+                    " cost more than the overlap saves.",
                     UserWarning,
                     stacklevel=2,
                 )
-            else:
-                use_ep_overlap = (
-                    _EP_OVERLAP_FC2_NATIVE if fc2_native_weight_layout else _EP_OVERLAP_ON
-                )
-                use_cudnn_jax_fusion = False
-                if not (cudnn_native_weight_layout and fc2_native_weight_layout):
-                    warnings.warn(
-                        "enable_ep_overlap=True with weights stored in the default layout: the"
-                        " overlap GEMMs read wi as [E, 2F, H] (cudnn_native_weight_layout=True) and"
-                        " wo as [E, H, F] (fc2_native_weight_layout=True), so each pass converts"
-                        " the weights in the graph (one weight-sized copy each way), which can"
-                        " cost more than the overlap saves.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
         if fc2_native_weight_layout and not use_ep_overlap:
             # wo is stored [E, H, F] (the overlap GEMM's layout); the regular path reads [E, F, H].
             wo = wo.transpose(0, 2, 1)
