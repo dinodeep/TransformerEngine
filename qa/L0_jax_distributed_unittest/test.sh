@@ -47,6 +47,10 @@ wait
 # >=4 visible GPUs.
 TE_PATH=$TE_PATH bash $TE_PATH/tests/jax/run_te_ep_moe.sh \
     || test_fail "test_te_ep_moe.py"
+# MoE receive-capacity overflow (drop_on_overflow=True); its own module because it bootstraps EP
+# with drops and a small capacity.
+TEST_FILE=$TE_PATH/tests/jax/test_te_ep_moe_overflow.py TE_PATH=$TE_PATH \
+    bash $TE_PATH/tests/jax/run_te_ep_moe.sh || test_fail "test_te_ep_moe_overflow.py"
 # Exercise the multi-GPU tutorial in docs/examples/jax (needs >= 4 GPUs;
 # auto-skips otherwise).
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m pytest -c $TE_PATH/tests/jax/pytest.ini -v --junitxml=$XML_LOG_DIR/pytest_docs_examples_jax_distributed.xml -k multi_gpu $TE_PATH/docs/examples/jax/ || test_fail "docs/examples/jax (multi-GPU)"

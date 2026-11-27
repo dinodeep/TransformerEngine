@@ -89,10 +89,10 @@ extern "C" {
  *                                        int32 elements. Capacity mode writes it; eager mode builds
  *                                        it from recv_tokens_per_expert. The last element is the
  *                                        recv total; the per-expert counts are its diffs.
- *  \param[out]    total_recv_tokens      [1] int32 recv total before any overflow drop. The routing
- *                                        prepare writes it; null when the dispatch writes
- *                                        expert_token_offsets, where expert_token_offsets[-1] is
- *                                        the padded total of the kept rows.
+ *  \param[out]    total_recv_tokens      [1] int32 recv total before any overflow drop, or null.
+ *                                        Unlike expert_token_offsets[-1], the padded total of the
+ *                                        kept rows, it counts dropped rows too, so callers can
+ *                                        detect an overflow.
  *  \param[in,out] workspace              uint8 scratch, nvte_ep_overlap_workspace_size bytes.
  *  \param[in]     layer_cfg              Per-layer EP configuration.
  *  \param[in]     stream                 CUDA stream.

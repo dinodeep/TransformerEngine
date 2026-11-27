@@ -852,6 +852,14 @@ void nvte_ep_dispatch_gemm_fwd(NVTETensor handle_mem, const NVTETensor topk_idx,
       gemm(&a, &b, &c, &d, &row_ends, &alpha, &prob, &ws, static_cast<void*>(stream));
     }
   }
+  // The dispatch that writes the expert layout runs without drops, so its row total is the pre-drop
+  // total. Copied after the GEMM launches so that the GEMM stays the dispatch's programmatic
+  // dependent.
+  if (device_layout && total_recv_tokens != nullptr) {
+    NVTE_CHECK_CUDA(cudaMemcpyAsync(nvte_tensor_data(total_recv_tokens),
+                                    scratch.row_ends - 1 + num_experts, sizeof(int32_t),
+                                    cudaMemcpyDeviceToDevice, stream));
+  }
 }
 
 void nvte_ep_combine_gemm_fwd(NVTETensor handle_mem, const NVTETensor gemm_in,

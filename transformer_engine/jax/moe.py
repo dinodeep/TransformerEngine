@@ -2458,6 +2458,7 @@ def _ep_overlap_fwd(
                 act_s,
                 counts,
                 offsets,
+                total,
                 handle_mem,
             ) = tex_ep_overlap.ep_dispatch_gemm_fwd(
                 idx,
@@ -2486,7 +2487,7 @@ def _ep_overlap_fwd(
             # The MXFP8 backward recomputes the activation; keep the received rows' scales instead.
             act_out = recv_scale
         else:
-            recv_tokens, _, recv_w, gemm_out, act_out, _, counts, offsets, handle_mem = (
+            recv_tokens, _, recv_w, gemm_out, act_out, _, counts, offsets, total, handle_mem = (
                 tex_ep_overlap.ep_dispatch_gemm_fwd(
                     idx, tokens, tw, w1_l, recv_capacity=recv_pr, alignment=align
                 )
@@ -2498,7 +2499,6 @@ def _ep_overlap_fwd(
         recv_tokens, recv_w, counts, handle_mem, gemm_out, act_out = _named(
             (recv_tokens, recv_w, counts, handle_mem, gemm_out, act_out)
         )
-        total = offsets[-1:]
         return (
             out.reshape(x_l.shape),
             total,

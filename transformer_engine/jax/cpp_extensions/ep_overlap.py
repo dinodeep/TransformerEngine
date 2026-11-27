@@ -141,8 +141,9 @@ def ep_dispatch_gemm_fwd(
     """Dispatch || FC1 + SwiGLU. tokens [T,H] (MXFP8: compact scales [T,H/32]); w1 [E,2F,H] (MXFP8:
     swizzled scales). Returns (recv_tokens [R,H], recv_scale_inv, recv_w [R] f32, gemm_out [R,2F]
     bf16, act_out [R,F], act_out_scale_inv, counts [E] i32, offsets [E+4] i32 (use [3:]),
-    handle_mem). BF16: act_out = silu(gate)*up*prob and the scale outputs are zero-size. MXFP8:
-    act_out = silu(gate)*up (the routing weight is applied to FC2's output)."""
+    total_recv_tokens [1] i32 (pre-drop, so it exposes an overflow), handle_mem). BF16: act_out =
+    silu(gate)*up*prob and the scale outputs are zero-size. MXFP8: act_out = silu(gate)*up (the
+    routing weight is applied to FC2's output)."""
     mx = _mxfp8(scaling_mode)
     H = tokens.shape[-1]
     K = topk_idx.shape[-1]
@@ -162,6 +163,7 @@ def ep_dispatch_gemm_fwd(
         _sds((R * F // 32,) if mx else (0,), _E8M0),
         _sds((E,), jnp.int32),
         _sds((E + 4,), jnp.int32),
+        _sds((1,), jnp.int32),
         _sds((hm,), jnp.uint8),
         _sds((ws,), jnp.uint8),
     )
@@ -174,7 +176,7 @@ def ep_dispatch_gemm_fwd(
         _empty() if w1_scale_inv is None else w1_scale_inv,
         **_attrs(K, alignment, topk_idx.dtype, scaling_mode),
     )
-    return tuple(res[:9])
+    return tuple(res[:10])
 
 
 def ep_combine_gemm_fwd(

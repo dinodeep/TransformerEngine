@@ -871,9 +871,9 @@ Error_Type EpDispatchGemmFwdFFI(
     Buffer_Type weight_scale_inv, Result_Type recv_tokens, Result_Type recv_scale_inv,
     Result_Type recv_topk_weights, Result_Type gemm_out, Result_Type act_out,
     Result_Type act_out_scale_inv, Result_Type recv_tokens_per_expert,
-    Result_Type expert_token_offsets, Result_Type handle_mem, Result_Type workspace, int64_t top_k,
-    int64_t dispatch_output_per_expert_alignment, int64_t topk_idx_dtype,
-    JAXX_Scaling_Mode scaling_mode) {
+    Result_Type expert_token_offsets, Result_Type total_recv_tokens, Result_Type handle_mem,
+    Result_Type workspace, int64_t top_k, int64_t dispatch_output_per_expert_alignment,
+    int64_t topk_idx_dtype, JAXX_Scaling_Mode scaling_mode) {
   (void)ep_state;
   auto layer_cfg = MakeLayerCfg(top_k, dispatch_output_per_expert_alignment, topk_idx_dtype);
   return ffi_guard("EP dispatch_gemm_fwd failed: ", [&] {
@@ -899,12 +899,14 @@ Error_Type EpDispatchGemmFwdFFI(
         WrapI32(recv_tokens_per_expert->untyped_data(), recv_tokens_per_expert->element_count());
     auto offsets_ =
         WrapOffsets(expert_token_offsets->untyped_data(), expert_token_offsets->element_count());
+    auto total_ = WrapI32(total_recv_tokens->untyped_data(), total_recv_tokens->element_count());
     auto handle_mem_ = WrapBytes(handle_mem->untyped_data(), handle_mem->size_bytes());
     auto ws_ = WrapBytes(workspace->untyped_data(), workspace->size_bytes());
-    nvte_ep_dispatch_gemm_fwd(
-        handle_mem_.data(), topk_idx_.data(), tokens_.data(), NVTECommWindow{nullptr, 0},
-        topk_weights_.data(), weight_.data(), recv_tokens_.data(), recv_w_.data(), gemm_out_.data(),
-        act_out_.data(), counts_.data(), offsets_.data(), nullptr, ws_.data(), &layer_cfg, stream);
+    nvte_ep_dispatch_gemm_fwd(handle_mem_.data(), topk_idx_.data(), tokens_.data(),
+                              NVTECommWindow{nullptr, 0}, topk_weights_.data(), weight_.data(),
+                              recv_tokens_.data(), recv_w_.data(), gemm_out_.data(),
+                              act_out_.data(), counts_.data(), offsets_.data(), total_.data(),
+                              ws_.data(), &layer_cfg, stream);
   });
 }
 
@@ -926,6 +928,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(EpDispatchGemmFwdHandler, EpDispatchGemmFwdFFI,
                                   .Ret<Buffer_Type>()  // act_out_scale_inv, swizzled (MXFP8)
                                   .Ret<Buffer_Type>()  // recv_tokens_per_expert [E] i32
                                   .Ret<Buffer_Type>()  // expert_token_offsets [E + 4] i32
+                                  .Ret<Buffer_Type>()  // total_recv_tokens [1] i32, pre-drop
                                   .Ret<Buffer_Type>()  // handle_mem
                                   .Ret<Buffer_Type>()  // workspace
                                   .Attr<int64_t>("top_k")

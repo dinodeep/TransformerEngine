@@ -1387,6 +1387,30 @@ def test_ep_remat_policy(mesh, make_block, use_cudnn_fusion, quantization, saved
     assert not failures, failures
 
 
+@pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
+def test_ep_overlap_total_recv_tokens(mesh, make_block, use_cudnn_fusion, quantization):
+    """The overlap's total_recv_tokens is the non-overlap path's for the same input: the
+    pre-drop receive total that callers compare to the capacity. Without drops it also equals
+    the padded kept-row total; test_te_ep_moe_overflow.py covers the dropping case."""
+    _skip_unless_overlap_available(True, use_cudnn_fusion)
+    x = _make_inputs(jax.random.PRNGKey(40))
+    totals = {}
+    for overlap in (False, True):
+        block = make_block(
+            enable_ep_overlap=overlap,
+            intermediate_size=OVERLAP_INTER,
+            quantization_recipe=_quantization_recipe(quantization),
+        )
+        with _ctx(mesh):
+            x_sh = _shard_inputs(x, mesh)
+            variables = jax.jit(block.init)(jax.random.PRNGKey(41), x_sh)
+            total = jax.jit(block.apply)(variables, x_sh)[2]
+        totals[overlap] = np.asarray(multihost_utils.process_allgather(total, tiled=True))
+    np.testing.assert_array_equal(totals[True], totals[False])
+    # The receive totals cover every routed slot (plus padding), so they are real counts.
+    assert int(totals[False].sum()) >= BATCH * SEQ * TOPK, totals[False]
+
+
 def test_ep_overlap_no_kernel_compile_at_execution(mesh, make_block, use_cudnn_fusion):
     """The CuTeDSL GEMMs compile while jit traces (nvte_ep_overlap_compile); executing the
     compiled step, first and later, never re-enters the Python compile/register entry points."""
